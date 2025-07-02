@@ -1,163 +1,166 @@
 #!/bin/bash
+# Ultimate Tunnel Manager (UTM) - Full Automation Script
 set -euo pipefail
 
-# Clear screen and header
+INSTALL_DIR="/opt/utm"
+mkdir -p "$INSTALL_DIR"
+
 clear
-echo -e "\e[1;34mUltimate Tunnel Manager (UTM) - UDP+TCP Tunnel Setup\e[0m"
-echo "========================================================="
+echo -e "\e[1;36mUltimate Tunnel Manager (UTM)\e[0m - Automated Tunnel Setup"
+echo "=============================================================="
 
-# -------- Functions -----------
-
-# Function to install packages if missing or upgrade
-install_or_upgrade() {
-  local pkg=$1
-  if ! command -v "$pkg" &>/dev/null; then
-    echo "Installing $pkg..."
-    apt-get update -qq
-    apt-get install -y "$pkg"
-  else
-    echo "$pkg is already installed, upgrading..."
-    apt-get update -qq
-    apt-get install --only-upgrade -y "$pkg"
-  fi
-}
-
-# Function to resolve domain to IP list
+# --- توابع کمکی ---
 resolve_ips() {
-  local domain=$1
-  # Use dig if available, fallback to host
-  if command -v dig &>/dev/null; then
-    dig +short "$domain" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}'
+  local domain="$1"
+  dig +short "$domain" | grep -Eo '([0-9]{1,3}\.){3}[0-9]+'
+}
+
+ssh_foreign() {
+  local host=$1 cmd=$2
+  if [[ "$SSH_METHOD" == "2" ]]; then
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER"@"$host" "$cmd"
   else
-    host "$domain" | awk '/has address/ { print $4 }'
+    sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no "$SSH_USER"@"$host" "$cmd"
   fi
 }
 
-# SSH command runner with password or key
-ssh_run() {
-  local host=$1
-  local user=$2
-  local pass=$3
-  local key=$4
-  local cmd=$5
-
-  if [[ -n "$key" ]]; then
-    ssh -i "$key" -o StrictHostKeyChecking=no "$user@$host" "$cmd"
+scp_foreign() {
+  local host=$1 localfile=$2 remotefile=$3
+  if [[ "$SSH_METHOD" == "2" ]]; then
+    scp -i "$SSH_KEY" -o StrictHostKeyChecking=no "$localfile" "$SSH_USER"@"$host":"$remotefile"
   else
-    # sshpass should be installed
-    sshpass -p "$pass" ssh -o StrictHostKeyChecking=no "$user@$host" "$cmd"
+    sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no "$localfile" "$SSH_USER"@"$host":"$remotefile"
   fi
 }
 
-scp_run() {
-  local host=$1
-  local user=$2
-  local pass=$3
-  local key=$4
-  local src=$5
-  local dst=$6
-
-  if [[ -n "$key" ]]; then
-    scp -i "$key" -o StrictHostKeyChecking=no "$src" "$user@$host:$dst"
-  else
-    sshpass -p "$pass" scp -o StrictHostKeyChecking=no "$src" "$user@$host:$dst"
-  fi
+install_tools() {
+  local tools=("$@")
+  apt-get update
+  apt-get install -y "${tools[@]}"
 }
 
-# Install or upgrade udp2raw on local or remote
 install_udp2raw() {
-  local target=$1 # "local" or host IP
-  local user=$2
-  local pass=$3
-  local key=$4
+  echo "[*] Installing udp2raw..."
+  curl -sL https://github.com/wangyu-/udp2raw-tunnel/releases/download/20190719.0/udp2raw_binaries.tar.gz | tar -xz -C /usr/local/bin/
+  chmod +x /usr/local/bin/udp2raw_amd64
+  ln -sf /usr/local/bin/udp2raw_amd64 /usr/local/bin/udp2raw
+}
 
-  local cmd_install="curl -L https://github.com/wangyu-/udp2raw-tunnel/releases/download/20190719.0/udp2raw_binaries.tar.gz | tar -xz -C /usr/local/bin/ && chmod +x /usr/local/bin/udp2raw_amd64 && ln -sf /usr/local/bin/udp2raw_amd64 /usr/local/bin/udp2raw"
+# --- پرسش‌های اصلی ---
+read -rp "Enter unique name for this Iranian server (e.g. iran1): " IRAN_NODE
 
-  if [[ "$target" == "local" ]]; then
-    echo "Installing udp2raw locally..."
-    bash -c "$cmd_install"
-  else
-    echo "Installing udp2raw on remote host $target..."
-    ssh_run "$target" "$user" "$pass" "$key" "$cmd_install"
+echo "Enter comma-separated foreign server hostnames or IPs (e.g. ssh.example.com,185.44.1.3):"
+read -rp "Foreign nodes: " FOREIGN_HOSTS_RAW
+IFS=',' read -ra FOREIGN_HOSTS <<< "$FOREIGN_HOSTS_RAW"
+
+echo "SSH method for foreign servers:"
+echo "1) Password (default)"
+echo "2) SSH Key"
+read -rp "Select [1-2]: " SSH_METHOD
+SSH_METHOD=${SSH_METHOD:-1}
+if [[ "$SSH_METHOD" == "2" ]]; then
+  read -rp "Path to SSH private key (default ~/.ssh/id_rsa): " SSH_KEY
+  SSH_KEY=${SSH_KEY:-~/.ssh/id_rsa}
+else
+  read -rp "SSH username for foreign servers (default root): " SSH_USER
+  SSH_USER=${SSH_USER:-root}
+fi
+
+declare -A ENABLED PROT_PORT TRANS_METHOD
+
+PROTOCOLS=(ssh vless vmess openvpn)
+
+for proto in "${PROTOCOLS[@]}"; do
+  read -rp "Enable tunnel for $proto? [y/N]: " yn
+  if [[ "$yn" =~ ^[Yy]$ ]]; then
+    default_port=""
+    case $proto in
+      ssh) default_port=4234 ;;
+      vless) default_port=41369 ;;
+      vmess) default_port=41374 ;;
+      openvpn) default_port=42347 ;;
+    esac
+    read -rp "Port for $proto (default $default_port): " port
+    port=${port:-$default_port}
+    ENABLED[$proto]=1
+    PROT_PORT[$proto]=$port
+
+    echo "Transport method for $proto:"
+    echo "1) TCP via HAProxy (default)"
+    echo "2) UDP via IPVS"
+    echo "3) UDP via iptables"
+    echo "4) UDP via socat"
+    echo "5) UDP via udp2raw"
+    read -rp "Select [1-5]: " method
+    case $method in
+      2) TRANS_METHOD[$proto]="ipvs" ;;
+      3) TRANS_METHOD[$proto]="iptables" ;;
+      4) TRANS_METHOD[$proto]="socat" ;;
+      5) TRANS_METHOD[$proto]="udp2raw" ;;
+      *) TRANS_METHOD[$proto]="haproxy" ;;
+    esac
   fi
-}
+done
 
-# Setup IPVS for UDP load balancing on local server
+# --- نصب ابزارها روی سرور ایران ---
+echo "[*] Installing required tools on Iranian server..."
+tools_to_install=(haproxy ipvsadm sshpass socat curl dnsutils)
+if [[ " ${TRANS_METHOD[@]} " =~ "udp2raw" ]]; then
+  install_udp2raw
+fi
+install_tools "${tools_to_install[@]}"
+
+# --- تعریف توابع کانفیگ ---
+
 setup_ipvs() {
-  local port=$1
-  shift
-  local remote_ips=("$@")
+  local proto=$1
+  local port=${PROT_PORT[$proto]}
+  local file="$INSTALL_DIR/ipvs-${IRAN_NODE}-${proto}.sh"
 
-  echo "Loading IPVS kernel modules..."
-  modprobe ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh nf_conntrack_ipv4 || true
+  echo "[*] Setting up IPVS for $proto on port $port"
 
-  echo "Clearing existing IPVS rules..."
-  ipvsadm -C || true
+  modprobe ip_vs
+  modprobe ip_vs_rr
 
-  echo "Adding IPVS virtual service on UDP port $port..."
-  ipvsadm -A -u 0.0.0.0:"$port" -s rr
+  cat > "$file" <<EOF
+#!/bin/bash
+modprobe ip_vs
+modprobe ip_vs_rr
+ipvsadm -C
+ipvsadm -A -u 0.0.0.0:$port -s rr
+EOF
 
-  for rip in "${remote_ips[@]}"; do
-    echo "Adding real server $rip:$port to IPVS..."
-    ipvsadm -a -u 0.0.0.0:"$port" -r "$rip":"$port" -m
+  for f in "${FOREIGN_HOSTS[@]}"; do
+    for ip in $(resolve_ips "$f"); do
+      echo "ipvsadm -a -u 0.0.0.0:$port -r $ip:$port -m" >> "$file"
+    done
   done
+  chmod +x "$file"
+  bash "$file"
+  (crontab -l 2>/dev/null | grep -v "$file"; echo "*/30 * * * * $file") | crontab -
 
-  echo "IPVS setup completed."
+  # Deploy روی سرورهای خارجی
+  echo "[*] Deploying IPVS setup to foreign servers..."
+  for f in "${FOREIGN_HOSTS[@]}"; do
+    for ip in $(resolve_ips "$f"); do
+      echo "[*] Configuring IPVS on $ip"
+      ssh_foreign "$ip" "apt-get update && apt-get install -y ipvsadm; modprobe ip_vs; modprobe ip_vs_rr"
+      scp_foreign "$ip" "$file" "/opt/utm/ipvs-${IRAN_NODE}-${proto}.sh"
+      ssh_foreign "$ip" "chmod +x /opt/utm/ipvs-${IRAN_NODE}-${proto}.sh"
+      ssh_foreign "$ip" "/opt/utm/ipvs-${IRAN_NODE}-${proto}.sh"
+      ssh_foreign "$ip" "(crontab -l 2>/dev/null | grep -v ipvs-${IRAN_NODE}-${proto}.sh; echo '*/30 * * * * /opt/utm/ipvs-${IRAN_NODE}-${proto}.sh') | crontab -"
+      ssh_foreign "$ip" "if [ -f /etc/rc.local ]; then grep -q ipvs-${IRAN_NODE}-${proto}.sh /etc/rc.local || echo '/opt/utm/ipvs-${IRAN_NODE}-${proto}.sh &' >> /etc/rc.local && chmod +x /etc/rc.local; fi"
+    done
+  done
 }
 
-# Setup systemd service for udp2raw on remote
-setup_udp2raw_service_remote() {
-  local host=$1
-  local user=$2
-  local pass=$3
-  local key=$4
-  local port=$5
-  local iran_ip=$6
-  local name=$7  # iran node name
-  local proto=$8 # protocol
-
-  local service_name="utm-udp2raw-$name-$proto"
-  local service_path="/etc/systemd/system/$service_name.service"
-
-  local service_content="[Unit]
-Description=UTM udp2raw tunnel for $proto from $name
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/udp2raw -c -l0.0.0.0:$port -r $iran_ip:$port --raw-mode faketcp --key secret_utm
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-"
-
-  echo "Creating udp2raw systemd service on $host..."
-  echo "$service_content" > /tmp/$service_name.service
-
-  scp_run "$host" "$user" "$pass" "$key" /tmp/$service_name.service "$service_path"
-  ssh_run "$host" "$user" "$pass" "$key" "systemctl daemon-reload && systemctl enable $service_name && systemctl restart $service_name"
-  rm -f /tmp/$service_name.service
-}
-
-# Setup HAProxy config locally
 setup_haproxy() {
-  local -n enabled_protos=$1
-  local -n proto_ports=$2
-  local -n proto_methods=$3
-  local -n foreign_hosts=$4
-
-  echo "Installing haproxy..."
-  install_or_upgrade haproxy
-
-  echo "Generating HAProxy config..."
-
+  echo "[*] Generating HAProxy config..."
   cat > /etc/haproxy/haproxy.cfg <<EOF
 global
   log /dev/log local0
   maxconn 4096
   daemon
-  tune.ssl.default-dh-param 2048
 
 defaults
   mode tcp
@@ -166,245 +169,120 @@ defaults
   timeout server 1h
 EOF
 
-  for proto in "${!enabled_protos[@]}"; do
-    if [[ "${proto_methods[$proto]}" == "haproxy" ]]; then
-      local port=${proto_ports[$proto]}
-      echo -e "\nfrontend ${proto}_in\n  bind *:$port\n  default_backend ${proto}_out" >> /etc/haproxy/haproxy.cfg
-      echo "backend ${proto}_out" >> /etc/haproxy/haproxy.cfg
-      for host in "${foreign_hosts[@]}"; do
-        for ip in $(resolve_ips "$host"); do
-          echo "  server ${proto}_$ip $ip:$port check" >> /etc/haproxy/haproxy.cfg
-        done
+  for proto in "${!ENABLED[@]}"; do
+    [[ ${TRANS_METHOD[$proto]} == "haproxy" ]] || continue
+    port=${PROT_PORT[$proto]}
+    echo -e "\nfrontend ${proto}_in\n  bind *:$port\n  default_backend ${proto}_out" >> /etc/haproxy/haproxy.cfg
+    echo "backend ${proto}_out" >> /etc/haproxy/haproxy.cfg
+    for h in "${FOREIGN_HOSTS[@]}"; do
+      for ip in $(resolve_ips "$h"); do
+        echo "  server ${proto}_$ip $ip:$port check" >> /etc/haproxy/haproxy.cfg
       done
-    fi
+    done
   done
-
-  systemctl restart haproxy
-  systemctl enable haproxy
-
-  echo "HAProxy setup done."
+  systemctl restart haproxy || true
+  (crontab -l 2>/dev/null; echo "0 */6 * * * systemctl restart haproxy") | crontab -
 }
 
-# Main menu for user interaction
-main_menu() {
-  echo ""
-  echo "Ultimate Tunnel Manager Menu:"
-  echo "1) Install / Configure Tunnel"
-  echo "2) Uninstall Tunnel"
-  echo "3) Show Tunnel Status"
-  echo "4) Exit"
-  echo ""
-  read -rp "Choose an option [1-4]: " choice
-  case "$choice" in
-    1) install_tunnel ;;
-    2) uninstall_tunnel ;;
-    3) show_status ;;
-    4) exit 0 ;;
-    *) echo "Invalid option." ; main_menu ;;
-  esac
-}
+setup_udp2raw() {
+  echo "[*] Installing and setting up udp2raw..."
+  install_udp2raw
 
-# Installation workflow
-install_tunnel() {
-  read -rp "Enter a unique name for this Iranian server (e.g. iran1): " IRAN_NAME
-
-  read -rp "Enter IP of this Iranian server (not domain): " IRAN_IP
-
-  echo "Enter foreign server domain or IP list (comma separated, e.g. fo.example.com,1.2.3.4):"
-  read -rp "Foreign servers: " FOREIGN_RAW
-  IFS=',' read -ra FOREIGN_HOSTS <<< "$FOREIGN_RAW"
-
-  # Collect SSH credentials for each foreign server
-  declare -A FOREIGN_USERS
-  declare -A FOREIGN_PASS
-  declare -A FOREIGN_KEYS
-
-  for host in "${FOREIGN_HOSTS[@]}"; do
-    echo "Credentials for foreign server $host:"
-    read -rp "Username (default root): " usr
-    usr=${usr:-root}
-    echo "Choose auth method for $host:"
-    echo "1) Password (default)"
-    echo "2) SSH Key"
-    read -rp "Select [1-2]: " auth
-    auth=${auth:-1}
-    if [[ "$auth" == "2" ]]; then
-      read -rp "Path to private key file: " key
-      FOREIGN_KEYS["$host"]="$key"
-      FOREIGN_USERS["$host"]="$usr"
-      FOREIGN_PASS["$host"]=""
-    else
-      read -rsp "Password for $usr@$host: " pass
-      echo
-      FOREIGN_PASS["$host"]="$pass"
-      FOREIGN_USERS["$host"]="$usr"
-      FOREIGN_KEYS["$host"]=""
-    fi
-  done
-
-  # Protocol configuration
-  declare -A ENABLED
-  declare -A PROT_PORT
-  declare -A TRANS_METHOD
-
-  PROTOCOLS=(ssh vless vmess openvpn)
-
-  for proto in "${PROTOCOLS[@]}"; do
-    read -rp "Enable tunnel for $proto? [y/N]: " yn
-    if [[ "$yn" =~ ^[Yy]$ ]]; then
-      # Default ports
-      case $proto in
-        ssh) def_port=4234;;
-        vless) def_port=41369;;
-        vmess) def_port=41374;;
-        openvpn) def_port=42347;;
-      esac
-      read -rp "Port for $proto (default $def_port): " port
-      port=${port:-$def_port}
-      ENABLED[$proto]=1
-      PROT_PORT[$proto]=$port
-
-      echo "Choose transport method for $proto:"
-      echo "1) TCP via HAProxy (default)"
-      echo "2) UDP via IPVS + udp2raw (recommended for openvpn)"
-      echo "3) UDP via iptables"
-      echo "4) UDP via socat"
-      echo "5) UDP via udp2raw"
-      read -rp "Select [1-5]: " method
-      case $method in
-        2) TRANS_METHOD[$proto]="ipvs" ;;
-        3) TRANS_METHOD[$proto]="iptables" ;;
-        4) TRANS_METHOD[$proto]="socat" ;;
-        5) TRANS_METHOD[$proto]="udp2raw" ;;
-        *) TRANS_METHOD[$proto]="haproxy" ;;
-      esac
-    fi
-  done
-
-  echo "Installing prerequisites..."
-  install_or_upgrade sshpass
-  install_or_upgrade ipvsadm
-  install_or_upgrade haproxy
-  install_or_upgrade curl
-  install_or_upgrade dnsutils
-  install_or_upgrade socat
-
-  # For iptables and socat, installation check handled when used.
-
-  # Setup IPVS for UDP protocols using IPVS + udp2raw
   for proto in "${!ENABLED[@]}"; do
-    if [[ "${TRANS_METHOD[$proto]}" == "ipvs" ]]; then
-      # Resolve foreign IPs for IPVS real servers
-      ALL_FOREIGN_IPS=()
-      for host in "${FOREIGN_HOSTS[@]}"; do
-        mapfile -t ips < <(resolve_ips "$host")
-        ALL_FOREIGN_IPS+=("${ips[@]}")
-      done
+    [[ ${TRANS_METHOD[$proto]} != "udp2raw" ]] && continue
+    port=${PROT_PORT[$proto]}
+    for f in "${FOREIGN_HOSTS[@]}"; do
+      for ip in $(resolve_ips "$f"); do
+        SERVICE="udp2raw-${IRAN_NODE}-${proto}"
+        TMPFILE="/tmp/$SERVICE.service"
 
-      # Setup IPVS for UDP port on local iran server
-      echo "Setting up IPVS for $proto on port ${PROT_PORT[$proto]}"
-      setup_ipvs "${PROT_PORT[$proto]}" "${ALL_FOREIGN_IPS[@]}"
-    fi
-  done
-
-  # Setup HAProxy for TCP protocols
-  setup_haproxy ENABLED PROT_PORT TRANS_METHOD FOREIGN_HOSTS
-
-  # Setup udp2raw on foreign servers for IPVS UDP tunnels
-  for proto in "${!ENABLED[@]}"; do
-    if [[ "${TRANS_METHOD[$proto]}" == "ipvs" ]]; then
-      for host in "${FOREIGN_HOSTS[@]}"; do
-        user=${FOREIGN_USERS[$host]}
-        pass=${FOREIGN_PASS[$host]}
-        key=${FOREIGN_KEYS[$host]:-}
-
-        install_udp2raw "$host" "$user" "$pass" "$key"
-        setup_udp2raw_service_remote "$host" "$user" "$pass" "$key" "${PROT_PORT[$proto]}" "$IRAN_IP" "$IRAN_NAME" "$proto"
-      done
-    fi
-  done
-
-  # Setup systemd timer to restart HAProxy and IPVS every 6 hours
-  echo "Setting up systemd timers to restart services every 6 hours..."
-
-  cat >/etc/systemd/system/utm-restart.timer <<EOF
+        cat > "$TMPFILE" <<EOL
 [Unit]
-Description=Restart UTM services every 6 hours
-
-[Timer]
-OnCalendar=hourly
-Persistent=true
-AccuracySec=10min
-Unit=utm-restart.service
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  cat >/etc/systemd/system/utm-restart.service <<EOF
-[Unit]
-Description=Restart UTM services
+Description=UTM UDP2RAW $proto $IRAN_NODE
+After=network.target
 
 [Service]
-Type=oneshot
-ExecStart=/bin/bash -c 'systemctl restart haproxy || true; echo "IPVS restart done on reboot."'
-EOF
+ExecStart=/usr/local/bin/udp2raw -c -l0.0.0.0:$port -r $ip:$port --raw-mode faketcp
+Restart=always
 
-  systemctl daemon-reload
-  systemctl enable --now utm-restart.timer
+[Install]
+WantedBy=multi-user.target
+EOL
+        scp_foreign "$ip" "$TMPFILE" "/etc/systemd/system/$SERVICE.service"
+        ssh_foreign "$ip" "systemctl daemon-reexec && systemctl enable $SERVICE && systemctl restart $SERVICE"
+      done
+    done
+  done
+}
 
-  echo -e "\n✅ Tunnel setup completed for Iran node: $IRAN_NAME"
-  echo "Active tunnels and transports:"
+setup_socat() {
+  echo "[*] Installing and setting up socat..."
+
+  install_tools socat
+
   for proto in "${!ENABLED[@]}"; do
-    echo "- $proto on port ${PROT_PORT[$proto]} via ${TRANS_METHOD[$proto]}"
-  done
-}
-
-uninstall_tunnel() {
-  echo "Removing UTM tunnels and cleaning up..."
-
-  systemctl stop haproxy || true
-  systemctl disable haproxy || true
-  rm -f /etc/haproxy/haproxy.cfg
-
-  ipvsadm -C || true
-
-  systemctl stop utm-restart.timer utm-restart.service || true
-  systemctl disable utm-restart.timer utm-restart.service || true
-  rm -f /etc/systemd/system/utm-restart.timer /etc/systemd/system/utm-restart.service
-
-  rm -rf /opt/utm
-
-  echo "Cleanup complete."
-}
-
-show_status() {
-  echo "Active tunnels:"
-  local found=0
-  for proto in "${!PROT_PORT[@]}"; do
+    [[ ${TRANS_METHOD[$proto]} != "socat" ]] && continue
     port=${PROT_PORT[$proto]}
-    # بررسی پورت فعال در ss
-    if ss -tunlp | grep -q ":$port "; then
-      ss -tunlp | grep ":$port "
-      found=1
-    fi
+    for f in "${FOREIGN_HOSTS[@]}"; do
+      for ip in $(resolve_ips "$f"); do
+        SERVICE="socat-${IRAN_NODE}-${proto}"
+        TMPFILE="/tmp/$SERVICE.service"
+
+        cat > "$TMPFILE" <<EOL
+[Unit]
+Description=UTM SOCAT $proto $IRAN_NODE
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/socat UDP-LISTEN:$port,fork UDP:$ip:$port
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOL
+        scp_foreign "$ip" "$TMPFILE" "/etc/systemd/system/$SERVICE.service"
+        ssh_foreign "$ip" "systemctl daemon-reexec && systemctl enable $SERVICE && systemctl restart $SERVICE"
+      done
+    done
   done
-  if [[ $found -eq 0 ]]; then
-    echo "No active tunnels found."
-  fi
-
-  echo "HAProxy status:"
-  systemctl status haproxy --no-pager || true
-
-  echo "IPVS rules:"
-  ipvsadm -Ln || true
-
-  echo "Timer status:"
-  systemctl status utm-restart.timer --no-pager || true
 }
 
+setup_iptables() {
+  echo "[*] Installing and setting up iptables for UDP forwarding..."
 
-# Main loop
-while true; do
-  main_menu
+  install_tools iptables-persistent
+
+  for proto in "${!ENABLED[@]}"; do
+    [[ ${TRANS_METHOD[$proto]} != "iptables" ]] && continue
+    port=${PROT_PORT[$proto]}
+    for f in "${FOREIGN_HOSTS[@]}"; do
+      for ip in $(resolve_ips "$f"); do
+        echo "[*] Adding iptables rules for $proto to forward UDP port $port to $ip"
+        iptables -t nat -A PREROUTING -p udp --dport "$port" -j DNAT --to-destination "$ip:$port"
+        iptables -t nat -A POSTROUTING -p udp -d "$ip" --dport "$port" -j MASQUERADE
+      done
+    done
+  done
+
+  netfilter-persistent save
+}
+
+# --- شروع نصب ---
+for proto in "${!ENABLED[@]}"; do
+  case ${TRANS_METHOD[$proto]} in
+    ipvs) setup_ipvs "$proto" ;;
+    haproxy) ;;
+    udp2raw) setup_udp2raw ;;
+    socat) setup_socat ;;
+    iptables) setup_iptables ;;
+  esac
 done
+
+setup_haproxy
+
+echo -e "\n✅ Setup complete for $IRAN_NODE"
+for proto in "${!ENABLED[@]}"; do
+  echo "- $proto on port ${PROT_PORT[$proto]} via ${TRANS_METHOD[$proto]}"
+done
+
+exit 0

@@ -1,32 +1,49 @@
 #!/bin/bash
-# File: install.sh - UTM (Ultimate Tunnel Manager)
-# Purpose: نصب و راه‌اندازی کامل تونل TCP/UDP بین سرور ایران و خارج با پورت دلخواه
+# install.sh – Ultimate Tunnel Manager (UTM)
+# اجرا فقط با دستور: bash install.sh
+# بر روی سرور ایران یا خارجی بدون سوال اضافه
 
 set -euo pipefail
 
+# پیام خوش‌آمدگویی
 clear
-echo "\n🚀 UTM Installer - Ultimate Tunnel Manager"
-echo "=========================================="
+echo -e "\n🚀 UTM Installer - Ultimate Tunnel Manager"
+echo "==========================================="
+
+echo "Select an option:"
+echo "1) Install / Configure Tunnels"
+echo "2) Uninstall UTM Completely"
+echo "3) Exit"
+read -p "Choice [1-3]: " choice
+
+if [[ "$choice" == "2" ]]; then
+  bash <(curl -fsSL https://raw.githubusercontent.com/taherimohsen/utm/main/uninstall.sh)
+  exit 0
+elif [[ "$choice" == "3" ]]; then
+  echo "Bye!"
+  exit 0
+fi
 
 # مسیرها
-BASE_DIR="/opt/utm"
-SCRIPT_DIR="$BASE_DIR/scripts"
-LOG_DIR="$BASE_DIR/logs"
-TEMPLATE_DIR="$BASE_DIR/templates"
+BASE="/opt/utm"
+SCRIPTS="$BASE/scripts"
+LOGS="$BASE/logs"
+TEMPLATE="$BASE/templates"
+mkdir -p "$SCRIPTS" "$LOGS" "$TEMPLATE"
 
-mkdir -p "$SCRIPT_DIR" "$LOG_DIR" "$TEMPLATE_DIR"
+# نصب پیش‌نیازها
+apt update
+apt install -y haproxy ufw socat iptables-persistent dnsutils curl netcat-openbsd rsyslog
 
-# نصب ابزارهای مورد نیاز
-apt update && apt install -y haproxy ufw socat iptables-persistent dnsutils curl netcat-openbsd rsyslog
-
-# نصب udp2raw اگر نصب نشده باشد
+# نصب udp2raw در صورت لزوم
 if ! command -v udp2raw &>/dev/null; then
   echo "🔽 Installing udp2raw..."
-  curl -L -o /usr/local/bin/udp2raw https://github.com/wangyu-/udp2raw-tunnel/releases/latest/download/udp2raw_amd64
+  curl -sL -o /usr/local/bin/udp2raw \
+    https://github.com/wangyu-/udp2raw-tunnel/releases/latest/download/udp2raw_amd64
   chmod +x /usr/local/bin/udp2raw
 fi
 
-# فعال‌سازی لاگ haproxy
+# فعال‌سازی لاگ HAProxy
 cat > /etc/rsyslog.d/49-haproxy.conf <<EOF
 if ($programname == 'haproxy') then /var/log/haproxy.log
 & stop
@@ -34,145 +51,105 @@ EOF
 systemctl restart rsyslog
 
 # فعال‌سازی IP forwarding
-if ! grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf; then
-  echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-  sysctl -p
-fi
+grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+sysctl -p
 
-# کد اصلی تنظیم تونل
-read -p "Is this server located in Iran? (y/n): " is_iran
+# گرفتن ورودی‌ها از کاربر
+read -p "Is this server in Iran? (y/n): " is_iran
+PROT=(SSH Vless Vmess OpenVPN)
+PORT=(); PT=(); BE=(); RP=(); M=()
 
-PROTOCOLS=("SSH" "Vless" "Vmess" "OpenVPN")
-PORTS=()
-PROTOCOL_TYPES=()
-BACKENDS=()
-REMOTE_PORTS=()
-METHODS=()
-
-for proto in "${PROTOCOLS[@]}"; do
-  read -p "Enable $proto? (y/n): " enable
-  if [[ "$enable" != "y" ]]; then
-    PORTS+=("")
-    PROTOCOL_TYPES+=("")
-    BACKENDS+=("")
-    REMOTE_PORTS+=("")
-    METHODS+=("")
+for p in "${PROT[@]}"; do
+  read -p "Enable $p? (y/n): " en
+  if [[ $en != y ]]; then
+    PORT+=(""); PT+=(""); BE+=(""); RP+=(""); M+=("")
     continue
   fi
+  read -p "  Local port for $p: " lp
+  read -p "  Protocol type (tcp/udp): " t
+  read -p "  Foreign server IP/domain: " bi
+  read -p "  Remote port at foreign side: " rp
 
-  read -p "Local port for $proto: " port
-  read -p "Protocol type (tcp/udp) for $proto: " ptype
-  read -p "Foreign server IP/domain: " backend
-  read -p "Remote port on foreign server: " remote_port
-
-  if [[ "$ptype" == "udp" ]]; then
-    echo "Select UDP tunneling method for $proto:"
-    echo "1) iptables (default)"
-    echo "2) socat"
-    echo "3) udp2raw"
-    read -p "Choice [1-3]: " choice
-    case $choice in
-      2) method="socat";;
-      3) method="udp2raw";;
-      *) method="iptables";;
-    esac
+  if [[ $t == udp ]]; then
+    echo "  Choose UDP method: 1)iptables 2)socat 3)udp2raw"
+    read -p "  choice [1-3]: " c
+    case $c in 2) md="socat";;3) md="udp2raw";;*) md="iptables";;esac
   else
-    method="haproxy"
+    md="haproxy"
   fi
 
-  PORTS+=("$port")
-  PROTOCOL_TYPES+=("$ptype")
-  BACKENDS+=("$backend")
-  REMOTE_PORTS+=("$remote_port")
-  METHODS+=("$method")
-
+  PORT+=("$lp"); PT+=("$t"); BE+=("$bi"); RP+=("$rp"); M+=("$md")
 done
 
-# ساخت فایل کانفیگ haproxy
+# ساخت تنظیمات HAProxy برای TCP
 cat > /etc/haproxy/haproxy.cfg <<EOF
 global
-    log /dev/log local0 info
-    daemon
+  log /dev/log local0 info
+  daemon
 
 defaults
-    log global
-    mode tcp
-    timeout connect 5s
-    timeout client 1h
-    timeout server 1h
+  log global
+  mode tcp
+  timeout connect 5s
+  timeout client 1h
+  timeout server 1h
 EOF
 
-# تنظیم هر پروتکل
-for i in "${!PROTOCOLS[@]}"; do
-  proto="${PROTOCOLS[$i]}"
-  port="${PORTS[$i]}"
-  ptype="${PROTOCOL_TYPES[$i]}"
-  backend="${BACKENDS[$i]}"
-  remote_port="${REMOTE_PORTS[$i]}"
-  method="${METHODS[$i]}"
+# پیکربندی تونل‌ها
+for i in "${!PROT[@]}"; do
+  p="${PROT[i]}"; lp="${PORT[i]}"; t="${PT[i]}"; bi="${BE[i]}"; rp="${RP[i]}"; md="${M[i]}"
+  [[ -z "$lp" ]] && continue
 
-  if [[ -z "$port" ]]; then
-    continue
-  fi
-
-  if [[ "$ptype" == "tcp" ]]; then
-    echo "🔧 Setting up TCP tunnel for $proto via HAProxy..."
+  if [[ $t == tcp ]]; then
+    echo "👉 Configuring TCP $p via HAProxy on port $lp..."
     cat >> /etc/haproxy/haproxy.cfg <<EOF
 
-frontend ${proto}_front
-    bind *:${port}
-    mode tcp
-    default_backend ${proto}_back
+frontend ${p}_front
+  bind *:${lp}
+  default_backend ${p}_back
 
-backend ${proto}_back
-    mode tcp
-    server ${proto}_server ${backend}:${remote_port} check
+backend ${p}_back
+  server ${p}_srv ${bi}:${rp} check
 EOF
-    ufw allow ${port}/tcp
+    ufw allow "$lp"/tcp
 
   else
-    echo "⚡ Setting up UDP tunnel for $proto via $method..."
-    case $method in
+    echo "👉 Configuring UDP $p via $md on port $lp..."
+    ufw allow "$lp"/udp
+    case $md in
       iptables)
-        iptables -t nat -A PREROUTING -p udp --dport $port -j DNAT --to-destination $backend:$remote_port
+        iptables -t nat -A PREROUTING -p udp --dport "$lp" -j DNAT --to-destination "${bi}:${rp}"
         iptables -t nat -A POSTROUTING -j MASQUERADE
         ;;
-
       socat)
-        nohup socat UDP4-RECVFROM:$port,fork UDP4-SENDTO:$backend:$remote_port &> "$LOG_DIR/${proto}_socat.log" &
+        nohup socat UDP4-RECVFROM:"$lp",fork UDP4-SENDTO:"${bi}:${rp}" \
+          &> "$LOGS/${p}_socat.log" &
         ;;
-
       udp2raw)
-        nohup udp2raw -c -r$backend:$remote_port -l0.0.0.0:$port -k utm-secret --raw-mode faketcp &> "$LOG_DIR/${proto}_udp2raw.log" &
+        nohup udp2raw -c -r"${bi}:${rp}" -l0.0.0.0:"$lp" -k utm-secret --raw-mode faketcp \
+          &> "$LOGS/${p}_udp2raw.log" &
         ;;
     esac
-    ufw allow ${port}/udp
   fi
-
 done
 
-# ریستارت سرویس‌ها
+# ری‌استارت و فعال‌سازی HAProxy
 if grep -q frontend /etc/haproxy/haproxy.cfg; then
   systemctl enable haproxy
   systemctl restart haproxy
 fi
 
+# ذخیره iptables و تنظیم UFW
 netfilter-persistent save
 ufw --force enable
 
-# نمایش خلاصه
-
-echo -e "\n✅ All tunnels have been configured."
-echo "📋 Summary:"
-for i in "${!PROTOCOLS[@]}"; do
-  if [[ -n "${PORTS[$i]}" ]]; then
-    echo "  ${PROTOCOLS[$i]} (${PROTOCOL_TYPES[$i]}): ${PORTS[$i]} → ${BACKENDS[$i]}:${REMOTE_PORTS[$i]} via ${METHODS[$i]}"
-  fi
+# نمایش نتیجه نهایی
+echo -e "\n✅ Tunnel setup complete. Summary:"
+for i in "${!PROT[@]}"; do
+  [[ -n "${PORT[i]}" ]] && \
+    echo " • ${PROT[i]} (${PT[i]}): ${PORT[i]} → ${BE[i]}:${RP[i]} (${M[i]})"
 done
-
-echo -e "\n📡 IP forwarding enabled"
-echo "🔐 Firewall adjusted"
-echo "🟢 HAProxy config: /etc/haproxy/haproxy.cfg"
-echo "🗂️ Logs: $LOG_DIR"
-echo -e "\n🚀 Done."
-exit 0
+echo -e "\n📌 IP forwarding: enabled"
+echo "📂 HAProxy config: /etc/haproxy/haproxy.cfg"
+echo "📄 Logs at: $LOGS"
+echo -e "\n🚀 All done."

@@ -1,27 +1,30 @@
 #!/bin/bash
-# حذف کامل تنظیمات UTM
+# uninstall.sh – حذف کامل UTM
+
+set -euo pipefail
 
 echo "🧹 Uninstalling Ultimate Tunnel Manager..."
 
-# توقف سرویس‌ها
 systemctl stop haproxy || true
-pkill -f socat || true
+systemctl disable haproxy || true
 pkill -f udp2raw || true
 
-# حذف کانفیگ‌ها و مسیرها
-rm -rf /etc/haproxy/haproxy.cfg
-rm -f /etc/rsyslog.d/49-haproxy.conf
+for proto in SSH Vless Vmess OpenVPN; do
+  systemctl stop udp2raw-${proto}.service || true
+  systemctl disable udp2raw-${proto}.service || true
+  rm -f /etc/systemd/system/udp2raw-${proto}.service
+done
+
+rm -f /etc/haproxy/haproxy.cfg
+rm -f /etc/systemd/system/utm-agent.service
+rm -f /opt/utm/scripts/foreign-agent-listen.sh
 rm -rf /opt/utm
 
-# حذف قوانین iptables
-iptables -t nat -F
-iptables -F
-netfilter-persistent save
+iptables -t nat -F || true
+iptables -F || true
+netfilter-persistent save || true
 
-# غیرفعال کردن HAProxy
-systemctl disable haproxy || true
+ufw --force disable
 
-# غیرفعال‌سازی UFW (در صورت تمایل)
-# ufw disable
-
-echo "✅ UTM has been fully removed."
+echo "✅ UTM fully removed."
+exit 0

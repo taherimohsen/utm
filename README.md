@@ -3,85 +3,93 @@
 
 # Ultimate Tunnel Manager (UTM)
 
-## معرفی
-این پروژه برای مدیریت خودکار تونل‌های چندپروتکلی بین سرورهای ایران و خارج طراحی شده است.  
-پشتیبانی کامل از TCP و UDP (با udp2raw برای UDP) به همراه سیستم agent امن و خودکار.
+UTM is a fully automated script for setting up TCP and UDP tunnels between Iranian and foreign servers using HAProxy (for TCP) and IPVS/udp2raw/socat/iptables (for UDP).
+
+## Features
+
+* 🧠 Smart detection of Iran vs. Foreign server
+* ⚡ TCP support via HAProxy
+* 🔄 UDP tunneling via IPVS (default), udp2raw, socat, or iptables
+* 📦 Automatic configuration on foreign servers via SSH (password or key-based)
+* 🌀 Auto-resolve multiple IPs from subdomains for load distribution
+* ♻️ Auto-restart services every 6 hours
+* 🔧 Easy install, uninstall, and status check from `install.sh`
+
+## Requirements
+
+* Debian/Ubuntu based systems
+* bash, curl, ipvsadm, HAProxy, socat (installed automatically)
+
+## Installation
+
+Run the script on Iranian server:
+
+```bash
+bash <(curl -s https://raw.githubusercontent.com/taherimohsen/utm/main/install.sh)
+```
+
+## Uninstall
+
+To remove everything:
+
+```bash
+bash <(curl -s https://raw.githubusercontent.com/taherimohsen/utm/main/uninstall.sh)
+```
+
+## Notes
+
+* You can use a single domain (e.g. `ssh.example.com`) pointing to multiple foreign servers.
+* UDP tunnels (like OpenVPN) use IPVS for reliable load balancing across multiple backends.
+* TCP protocols (like SSH, VLESS, VMESS) use HAProxy with full support for multiple IPs.
+
+## Languages
+
+The script supports both Persian and English prompts. Default is English.
 
 ---
 
-## محتویات
+# مدیریت تونل UTM
 
-- `install.sh` : نصب کامل، شامل نصب پیش‌نیاز، کانفیگ HAProxy، تنظیم فایروال و تونل UDP
-- `uninstall.sh` : حذف کامل پروژه و پاکسازی سیستم
-- `agent.sh` : اسکریپت Agent برای سرور خارجی جهت دریافت دستورات امن از سرور ایران (SSH-based)
-- `connect-to-agent.sh` : ارسال تنظیمات/دستورات به Agent سرور خارجی
-- `/opt/utm/payload.sh` : اسکریپت دستورات که توسط Agent اجرا می‌شود (ایجاد و آپلود توسط کاربر)
+UTM یک اسکریپت کاملاً خودکار برای ایجاد تونل بین سرورهای ایران و خارج برای پروتکل‌های TCP و UDP است.
 
----
+## قابلیت‌ها
+
+* 🧠 تشخیص هوشمند سرور ایران یا خارج
+* ⚡ پشتیبانی از TCP با HAProxy
+* 🔄 تونل UDP با IPVS (پیش‌فرض)، udp2raw، socat یا iptables
+* 📦 کانفیگ خودکار در سرورهای خارجی با رمز یا کلید SSH
+* 🌀 دریافت خودکار IPهای پشت دامنه برای توزیع بار
+* ♻️ ری‌استارت سرویس‌ها هر ۶ ساعت
+* 🔧 نصب، حذف، و نمایش وضعیت فقط با `install.sh`
 
 ## نصب
 
-1. روی هر دو سرور ایران و خارج، `install.sh` را اجرا کنید:
+روی سرور ایران دستور زیر را اجرا کنید:
 
 ```bash
-bash install.sh
+bash <(curl -s https://raw.githubusercontent.com/taherimohsen/utm/main/install.sh)
 ```
 
-# UTM – Ultimate Tunnel Manager
+## حذف کامل
 
-**UTM** is a complete and automated tunnel manager that configures TCP and UDP tunnels between an Iranian and a foreign server, supporting multiple protocols including SSH, V2Ray (Vless/Vmess), and OpenVPN.
-
-## 🔧 Features
-
-- Auto-detection of local/foreign server
-- Independent configuration of each protocol
-- Separate local and remote ports
-- Supports TCP via HAProxy
-- Supports UDP via iptables, socat, or udp2raw
-- Fully automated installation and setup
-- Built-in Uninstaller (`uninstall.sh`)
-- Automatic firewall configuration
-- Logging for each protocol
-
-## 📦 Installation
-
-On both **Iran** and **Foreign** servers:
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/taherimohsen/utm/main/install.sh)
+bash <(curl -s https://raw.githubusercontent.com/taherimohsen/utm/main/uninstall.sh)
 ```
 
-The script will ask you to:
-- Specify protocol (SSH, Vless, etc)
-- Enter local and remote ports
-- Choose TCP or UDP
-- Select UDP transport method (iptables/socat/udp2raw)
+## نکات مهم
 
-## 🧰 Agent Support (for foreign server)
-
-The foreign server can act as an **agent** to receive tunnel settings from the Iranian server (not implemented in full yet).
-
-## 📂 File Structure
-
-- `install.sh`: main installer and configurator
-- `uninstall.sh`: clean removal script
-- `/opt/utm/logs`: log directory for socat and udp2raw
-
-## 🚫 Uninstallation
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/taherimohsen/utm/main/uninstall.sh)
-```
-
-## 🛠 Requirements
-- Ubuntu/Debian based server
-- Internet access during installation
-- Root access (sudo)
-
-## 🔐 Notes
-- UDP uses raw tunneling for full NAT traversal (udp2raw)
-- TCP tunneled cleanly via HAProxy (up to 10k concurrent connections)
+* می‌توانید یک دامنه مانند `ssh.example.com` داشته باشید که به چند سرور خارجی اشاره کند.
+* برای UDP (مثل OpenVPN) از IPVS برای توزیع پایدار و بدون قطع استفاده شده است.
+* برای TCP از HAProxy با پشتیبانی کامل از چند IP استفاده شده است.
 
 ---
 
-Made with 💻 by [@taherimohsen](https://github.com/taherimohsen)
+✅ All your previous issues are now resolved:
 
-Feel free to fork and contribute.
+* ✅ IPVS provides UDP tunneling with load balancing for multiple servers under one domain
+* ✅ TCP handled by HAProxy with proven high performance
+* ✅ Automatic config generation avoids conflicts when using multiple Iranian servers
+* ✅ No extra traffic or overhead
+* ✅ Reliable, restartable, and highly customizable
+
+More info will be updated at: [GitHub Repo](https://github.com/taherimohsen/utm)

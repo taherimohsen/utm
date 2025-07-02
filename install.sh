@@ -217,12 +217,12 @@ EOF
 # نصب udp2raw اگر انتخاب شده و انتقال به خارج
 install_udp2raw_and_setup() {
  echo "[Iran] Installing udp2raw..."
-  URL="https://github.com/wangyu-/udp2raw/releases/download/20230206.0/udp2raw_binaries.tar.gz"
-  curl -L "$URL" -o /tmp/udp2raw_binaries.tar.gz
-  tar -xzf /tmp/udp2raw_binaries.tar.gz -C /usr/local/bin/
-  chmod +x /usr/local/bin/udp2raw_amd64
-  ln -sf /usr/local/bin/udp2raw_amd64 /usr/local/bin/udp2raw
-  rm -f /tmp/udp2raw_binaries.tar.gz
+
+  # لینک مستقیم و سالم
+  URL="https://raw.githubusercontent.com/tindy2013/udp2raw-tunnel/master/bin/udp2raw_amd64"
+
+  curl -L "$URL" -o /usr/local/bin/udp2raw
+  chmod +x /usr/local/bin/udp2raw
 
   for proto in "${!ENABLED[@]}"; do
     [[ ${TRANS_METHOD[$proto]} != "udp2raw" ]] && continue

@@ -380,14 +380,29 @@ uninstall_tunnel() {
 
 show_status() {
   echo "Active tunnels:"
-  ss -tunlp | grep -E '4234|4136[49]|42347' || echo "No active tunnels found."
+  local found=0
+  for proto in "${!PROT_PORT[@]}"; do
+    port=${PROT_PORT[$proto]}
+    # بررسی پورت فعال در ss
+    if ss -tunlp | grep -q ":$port "; then
+      ss -tunlp | grep ":$port "
+      found=1
+    fi
+  done
+  if [[ $found -eq 0 ]]; then
+    echo "No active tunnels found."
+  fi
+
   echo "HAProxy status:"
   systemctl status haproxy --no-pager || true
+
   echo "IPVS rules:"
   ipvsadm -Ln || true
+
   echo "Timer status:"
   systemctl status utm-restart.timer --no-pager || true
 }
+
 
 # Main loop
 while true; do

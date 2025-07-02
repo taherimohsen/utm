@@ -1,15 +1,19 @@
 #!/bin/bash
 # install.sh – Ultimate Tunnel Manager (UTM)
-# اجرا فقط با دستور: bash install.sh
-# بر روی سرور ایران یا خارجی بدون سوال اضافه
+# اجرای کامل و خودکار در سرور ایران یا خارج
 
 set -euo pipefail
 
-# پیام خوش‌آمدگویی
 clear
-echo -e "\n🚀 UTM Installer - Ultimate Tunnel Manager"
-echo "==========================================="
+echo -e "\n🚀 Ultimate Tunnel Manager (UTM)"
+echo "================================"
 
+# مسیرهای پایه
+BASE="/opt/utm"
+LOGS="$BASE/logs"
+mkdir -p "$LOGS"
+
+# منوی اصلی
 echo "Select an option:"
 echo "1) Install / Configure Tunnels"
 echo "2) Uninstall UTM Completely"
@@ -20,68 +24,53 @@ if [[ "$choice" == "2" ]]; then
   bash <(curl -fsSL https://raw.githubusercontent.com/taherimohsen/utm/main/uninstall.sh)
   exit 0
 elif [[ "$choice" == "3" ]]; then
-  echo "Bye!"
-  exit 0
+  echo "Bye!"; exit 0
 fi
-
-# مسیرها
-BASE="/opt/utm"
-SCRIPTS="$BASE/scripts"
-LOGS="$BASE/logs"
-TEMPLATE="$BASE/templates"
-mkdir -p "$SCRIPTS" "$LOGS" "$TEMPLATE"
 
 # نصب پیش‌نیازها
 apt update
 apt install -y haproxy ufw socat iptables-persistent dnsutils curl netcat-openbsd rsyslog
 
-# نصب udp2raw در صورت لزوم
+# نصب udp2raw در صورت نیاز
 if ! command -v udp2raw &>/dev/null; then
-  echo "🔽 Installing udp2raw..."
-  curl -sL -o /usr/local/bin/udp2raw \
-    https://github.com/wangyu-/udp2raw-tunnel/releases/latest/download/udp2raw_amd64
+  curl -sL -o /usr/local/bin/udp2raw https://github.com/wangyu-/udp2raw-tunnel/releases/latest/download/udp2raw_amd64
   chmod +x /usr/local/bin/udp2raw
 fi
 
-# فعال‌سازی لاگ HAProxy
+# فعال‌سازی لاگ و IP forwarding
+echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+sysctl -p
 cat > /etc/rsyslog.d/49-haproxy.conf <<EOF
 if ($programname == 'haproxy') then /var/log/haproxy.log
 & stop
 EOF
 systemctl restart rsyslog
 
-# فعال‌سازی IP forwarding
-grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-sysctl -p
-
-# گرفتن ورودی‌ها از کاربر
+# گرفتن موقعیت سرور
 read -p "Is this server in Iran? (y/n): " is_iran
+
+# پروتکل‌ها
 PROT=(SSH Vless Vmess OpenVPN)
 PORT=(); PT=(); BE=(); RP=(); M=()
 
 for p in "${PROT[@]}"; do
   read -p "Enable $p? (y/n): " en
-  if [[ $en != y ]]; then
-    PORT+=(""); PT+=(""); BE+=(""); RP+=(""); M+=("")
-    continue
-  fi
+  if [[ $en != y ]]; then PORT+=(""); PT+=(""); BE+=(""); RP+=(""); M+=(""); continue; fi
   read -p "  Local port for $p: " lp
   read -p "  Protocol type (tcp/udp): " t
   read -p "  Foreign server IP/domain: " bi
   read -p "  Remote port at foreign side: " rp
-
   if [[ $t == udp ]]; then
-    echo "  Choose UDP method: 1)iptables 2)socat 3)udp2raw"
+    echo "  Choose UDP method: 1) iptables 2) socat 3) udp2raw"
     read -p "  choice [1-3]: " c
     case $c in 2) md="socat";;3) md="udp2raw";;*) md="iptables";;esac
   else
     md="haproxy"
   fi
-
   PORT+=("$lp"); PT+=("$t"); BE+=("$bi"); RP+=("$rp"); M+=("$md")
 done
 
-# ساخت تنظیمات HAProxy برای TCP
+# تنظیم HAProxy برای TCP
 cat > /etc/haproxy/haproxy.cfg <<EOF
 global
   log /dev/log local0 info
@@ -95,13 +84,11 @@ defaults
   timeout server 1h
 EOF
 
-# پیکربندی تونل‌ها
 for i in "${!PROT[@]}"; do
+  [[ -z "${PORT[i]}" ]] && continue
   p="${PROT[i]}"; lp="${PORT[i]}"; t="${PT[i]}"; bi="${BE[i]}"; rp="${RP[i]}"; md="${M[i]}"
-  [[ -z "$lp" ]] && continue
-
+  
   if [[ $t == tcp ]]; then
-    echo "👉 Configuring TCP $p via HAProxy on port $lp..."
     cat >> /etc/haproxy/haproxy.cfg <<EOF
 
 frontend ${p}_front
@@ -112,9 +99,7 @@ backend ${p}_back
   server ${p}_srv ${bi}:${rp} check
 EOF
     ufw allow "$lp"/tcp
-
   else
-    echo "👉 Configuring UDP $p via $md on port $lp..."
     ufw allow "$lp"/udp
     case $md in
       iptables)
@@ -122,34 +107,29 @@ EOF
         iptables -t nat -A POSTROUTING -j MASQUERADE
         ;;
       socat)
-        nohup socat UDP4-RECVFROM:"$lp",fork UDP4-SENDTO:"${bi}:${rp}" \
-          &> "$LOGS/${p}_socat.log" &
+        nohup socat UDP4-RECVFROM:"$lp",fork UDP4-SENDTO:"${bi}:${rp}" >> "$LOGS/${p}_socat.log" 2>&1 &
         ;;
       udp2raw)
-        nohup udp2raw -c -r"${bi}:${rp}" -l0.0.0.0:"$lp" -k utm-secret --raw-mode faketcp \
-          &> "$LOGS/${p}_udp2raw.log" &
+        nohup udp2raw -c -r"${bi}:${rp}" -l0.0.0.0:"$lp" -k utm-secret --raw-mode faketcp >> "$LOGS/${p}_udp2raw.log" 2>&1 &
         ;;
     esac
   fi
 done
 
-# ری‌استارت و فعال‌سازی HAProxy
+# راه‌اندازی HAProxy در صورت وجود TCP
 if grep -q frontend /etc/haproxy/haproxy.cfg; then
   systemctl enable haproxy
   systemctl restart haproxy
 fi
 
-# ذخیره iptables و تنظیم UFW
 netfilter-persistent save
 ufw --force enable
 
-# نمایش نتیجه نهایی
+# خلاصه
 echo -e "\n✅ Tunnel setup complete. Summary:"
 for i in "${!PROT[@]}"; do
   [[ -n "${PORT[i]}" ]] && \
-    echo " • ${PROT[i]} (${PT[i]}): ${PORT[i]} → ${BE[i]}:${RP[i]} (${M[i]})"
+  echo " • ${PROT[i]} (${PT[i]}): ${PORT[i]} → ${BE[i]}:${RP[i]} (${M[i]})"
 done
-echo -e "\n📌 IP forwarding: enabled"
-echo "📂 HAProxy config: /etc/haproxy/haproxy.cfg"
-echo "📄 Logs at: $LOGS"
-echo -e "\n🚀 All done."
+
+exit 0

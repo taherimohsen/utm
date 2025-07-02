@@ -2,7 +2,7 @@
 set -euo pipefail
 clear
 echo -e "\e[1;36mUltimate Tunnel Manager (UTM) - Setup\e[0m"
-echo "============================================="
+echo "=================================================="
 
 # ابزار کمکی برای گرفتن IP ها از دامنه
 resolve_ips() {
@@ -217,7 +217,7 @@ EOF
 # نصب udp2raw اگر انتخاب شده و انتقال به خارج
 install_udp2raw_and_setup() {
  echo "[Iran] Installing udp2raw..."
-  URL="https://github.com/wangyu-/udp2raw-tunnel/releases/download/20221014.0/udp2raw_binaries.tar.gz"
+  URL="https://github.com/wangyu-/udp2raw/releases/download/20230206.0/udp2raw_binaries.tar.gz"
   curl -L "$URL" -o /tmp/udp2raw_binaries.tar.gz
   tar -xzf /tmp/udp2raw_binaries.tar.gz -C /usr/local/bin/
   chmod +x /usr/local/bin/udp2raw_amd64

@@ -218,11 +218,22 @@ EOF
 install_udp2raw_and_setup() {
  echo "[Iran] Installing UDP2raw..."
 
-  # لینک مستقیم و سالم
-  URL="https://raw.githubusercontent.com/tindy2013/udp2raw-tunnel/master/bin/udp2raw_amd64"
+  # ساخت پوشه برای باینری‌ها
+  mkdir -p /usr/local/bin
 
-  curl -L "$URL" -o /usr/local/bin/udp2raw
+  # دانلود مستقیم فایل udp2raw برای معماری x86_64
+  curl -L -o /usr/local/bin/udp2raw https://github.com/wangyu-/udp2raw-tunnel/releases/download/20200729.0/udp2raw_amd64
+
+  # تعیین سطح دسترسی اجرا
   chmod +x /usr/local/bin/udp2raw
+
+  # بررسی نصب موفق
+  if ! command -v udp2raw >/dev/null 2>&1; then
+    echo "❌ udp2raw installation failed"
+    exit 1
+  fi
+
+  echo "✅ udp2raw installed successfully"
 
   for proto in "${!ENABLED[@]}"; do
     [[ ${TRANS_METHOD[$proto]} != "udp2raw" ]] && continue

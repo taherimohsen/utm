@@ -216,7 +216,7 @@ EOF
 
 # نصب udp2raw اگر انتخاب شده و انتقال به خارج
 install_udp2raw_and_setup() {
- echo "[Iran] Installing udp2raw..."
+ echo "[Iran] Installing UDP2raw..."
 
   # لینک مستقیم و سالم
   URL="https://raw.githubusercontent.com/tindy2013/udp2raw-tunnel/master/bin/udp2raw_amd64"

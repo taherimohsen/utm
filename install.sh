@@ -1,186 +1,382 @@
 #!/bin/bash
-# Ultimate Tunnel Manager - install.sh (Final Stable Version)
+# Ultimate Tunnel Manager with 30-minute session persistence
 set -euo pipefail
 
-echo -e "\e[1;36mUTM - Ultimate Tunnel Manager\e[0m"
-echo "===================================="
+# Configurations
+CONFIG_DIR="/etc/utm"
+LOG_DIR="/var/log/utm"
+LOCK_DIR="/var/lock/utm"
 
-function pause() { read -rp "Press Enter to continue..."; }
+# Create directories
+mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$LOCK_DIR"
 
-function install_dependencies() {
-  echo "[*] Installing dependencies on Iranian server..."
-  apt update && apt install -y ipvsadm curl dnsutils sshpass haproxy socat
+function show_header() {
+  clear
+  echo "========================================"
+  echo "  Ultimate Tunnel Manager (Persistent)"
+  echo "  Version: 3.1 | 30-min Session Persistence"
+  echo "========================================"
 }
 
-function menu() {
-  echo -e "\n1) Install / Configure Tunnel"
-  echo "2) Uninstall"
-  echo "3) Status"
-  echo "4) Exit"
-  read -rp "Select an option [1-4]: " opt
-  case $opt in
-    1) install_dependencies; setup_tunnel;;
-    2) uninstall;;
-    3) show_status;;
-    *) exit 0;;
-  esac
+function pause() {
+  read -rp "Press Enter to continue..."
 }
 
-function setup_tunnel() {
-  read -rp "Enter a unique name for this Iranian server (e.g. iran1): " IRAN_NODE
-  read -rp "Enter comma-separated foreign domains/IPs (e.g. fo1.com,fo2.com): " HOSTS_RAW
-  IFS=',' read -ra HOSTS <<< "$HOSTS_RAW"
+function install_deps() {
+  echo "[*] Installing required packages..."
+  apt update && apt install -y \
+    ipvsadm haproxy curl dnsutils \
+    jq net-tools socat rsyslog
+}
 
-  declare -A HOST_IPS
-  declare -A CREDENTIALS
+function setup_ipvs() {
+  local proto=$1
+  local port=$2
+  local server_id=$3
+  shift 3
+  local servers=("$@")
+  
+  local config_file="$CONFIG_DIR/$server_id/ipvs-$proto.sh"
 
-  for host in "${HOSTS[@]}"; do
-    echo "[*] Resolving $host..."
-    ips=$(dig +short "$host" | grep -Eo '([0-9]{1,3}\.){3}[0-9]+')
-    for ip in $ips; do
-      HOST_IPS[$ip]=$host
-      echo -e "Enter credentials for $ip (resolved from $host):"
-      read -rp " - Username: " user
-      read -rsp " - Password: " pass
-      echo
-      CREDENTIALS[$ip]="$user:$pass"
-    done
-  done
-
-  declare -A ENABLED PROT_PORT TRANS
-  PROTOCOLS=(ssh vless vmess openvpn)
-
-  for proto in "${PROTOCOLS[@]}"; do
-    read -rp "Enable $proto tunnel? [y/N]: " yn
-    [[ "$yn" =~ ^[Yy]$ ]] || continue
-    read -rp "Port for $proto: " port
-    ENABLED[$proto]=1
-    PROT_PORT[$proto]=$port
-
-    echo "Transport for $proto:"
-    echo "1) TCP via HAProxy"
-    echo "2) UDP via iptables"
-    echo "3) UDP via socat"
-    echo "4) UDP via udp2raw"
-    echo "5) UDP via IPVS"
-    read -rp "Select [1-5]: " method
-    case $method in
-      2) TRANS[$proto]="iptables";;
-      3) TRANS[$proto]="socat";;
-      4) TRANS[$proto]="udp2raw";;
-      5) TRANS[$proto]="ipvs";;
-      *) TRANS[$proto]="haproxy";;
-    esac
-  done
-
-  configure_ipvs() {
-    local proto=$1
-    local port=${PROT_PORT[$proto]}
-    local fpath=/opt/utm/ipvs-${IRAN_NODE}-${proto}.sh
-    mkdir -p /opt/utm
-    cat > "$fpath" <<EOF
+  cat > "$config_file" <<EOF
 #!/bin/bash
+# IPVS Config for $proto - $server_id with 30-min persistence
+
+# Load kernel modules
 modprobe ip_vs
 modprobe ip_vs_rr
-ipvsadm -C
-ipvsadm -A -u 0.0.0.0:$port -s rr
-EOF
-    for ip in "${!HOST_IPS[@]}"; do
-      echo "ipvsadm -a -u 0.0.0.0:$port -r $ip:$port -m" >> "$fpath"
-    done
-    chmod +x "$fpath"
-    bash "$fpath"
-    (crontab -l 2>/dev/null; echo "*/15 * * * * $fpath") | crontab -
-    grep -q "$fpath" /etc/rc.local || echo "$fpath &" >> /etc/rc.local
-  }
+modprobe ip_vs_wrr
+modprobe nf_conntrack_ipv4
 
-  configure_haproxy() {
-    echo "[*] Writing HAProxy config..."
-    cat > /etc/haproxy/haproxy.cfg <<EOF
+# Enable IP forwarding
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# Persistence settings (1800 seconds = 30 minutes)
+echo 1800 > /proc/sys/net/ipv4/vs/expire_nodest_conn
+echo 1 > /proc/sys/net/ipv4/vs/expire_quiescent_template
+
+# Clear old rules
+ipvsadm -C
+
+# Add UDP service with persistence
+ipvsadm -A -u 0.0.0.0:$port -s rr -p 1800
+EOF
+
+  for ip in "${servers[@]}"; do
+    echo "ipvsadm -a -u 0.0.0.0:$port -r $ip:$port -m" >> "$config_file"
+  done
+
+  # Health check script
+  cat > "$CONFIG_DIR/$server_id/healthcheck-$proto.sh" <<EOF
+#!/bin/bash
+# Health check for $proto servers
+
+for ip in ${servers[@]}; do
+  if ! nc -zuv -w 3 \$ip $port; then
+    ipvsadm -d -u 0.0.0.0:$port -r \$ip:$port
+    logger -t UTM "Server \$ip:$port removed from rotation"
+  else
+    ipvsadm -a -u 0.0.0.0:$port -r \$ip:$port -m 2>/dev/null || true
+  fi
+done
+EOF
+
+  chmod +x "$config_file" "$CONFIG_DIR/$server_id/healthcheck-$proto.sh"
+  bash "$config_file"
+
+  # Create systemd service
+  cat > "/etc/systemd/system/ipvs-$server_id-$proto.service" <<EOF
+[Unit]
+Description=IPVS for $proto - $server_id
+After=network.target
+
+[Service]
+ExecStart=$config_file
+ExecStartPost=/bin/bash $CONFIG_DIR/$server_id/healthcheck-$proto.sh
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  # Health check timer
+  cat > "/etc/systemd/system/healthcheck-$server_id-$proto.timer" <<EOF
+[Unit]
+Description=Health check for $proto - $server_id
+
+[Timer]
+OnUnitActiveSec=60s
+OnBootSec=60s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  cat > "/etc/systemd/system/healthcheck-$server_id-$proto.service" <<EOF
+[Unit]
+Description=Health check for $proto - $server_id
+
+[Service]
+ExecStart=/bin/bash $CONFIG_DIR/$server_id/healthcheck-$proto.sh
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now "ipvs-$server_id-$proto"
+  systemctl enable --now "healthcheck-$server_id-$proto.timer"
+}
+
+function setup_haproxy() {
+  local server_id=$1
+  shift
+  local protocols=("$@")
+  
+  local config_file="$CONFIG_DIR/$server_id/haproxy.cfg"
+
+  cat > "$config_file" <<EOF
 global
   log /dev/log local0
   daemon
   maxconn 2048
+  tune.ssl.default-dh-param 2048
 
 defaults
   mode tcp
   timeout connect 5s
   timeout client 1h
   timeout server 1h
+  timeout tunnel 1h
 EOF
 
-    for proto in "${!ENABLED[@]}"; do
-      [[ ${TRANS[$proto]} == "haproxy" ]] || continue
-      port=${PROT_PORT[$proto]}
-      echo -e "\nfrontend ${proto}_in\n  bind *:$port\n  default_backend ${proto}_out" >> /etc/haproxy/haproxy.cfg
-      echo "backend ${proto}_out" >> /etc/haproxy/haproxy.cfg
-      for ip in "${!HOST_IPS[@]}"; do
-        echo "  server ${proto}_$ip $ip:$port check" >> /etc/haproxy/haproxy.cfg
-      done
+  for proto in "${protocols[@]}"; do
+    local port=$(jq -r ".protocols.$proto.port" "$CONFIG_DIR/$server_id/config.json")
+    local servers=$(jq -r '.foreign_servers | keys[]' "$CONFIG_DIR/$server_id/config.json")
+    
+    cat >> "$config_file" <<EOF
+
+# $proto configuration
+frontend ${proto}_$server_id
+  bind *:$port
+  default_backend ${proto}_back_$server_id
+
+backend ${proto}_back_$server_id
+  mode tcp
+  balance source
+  stick-table type ip size 200k expire 30m
+  stick on src
+EOF
+
+    for ip in $servers; do
+      echo "  server ${proto}_${ip//./_} $ip:$port check inter 10s fall 3 rise 2" >> "$config_file"
     done
-    systemctl restart haproxy || true
-  }
+  done
 
-  configure_udp2raw_remote() {
-    local proto=$1
-    local port=${PROT_PORT[$proto]}
-    local iran_ip=$(curl -s https://ipinfo.io/ip)
-
-    for ip in "${!HOST_IPS[@]}"; do
-      echo "[Foreign:$ip] Installing udp2raw for $proto:$port"
-      creds="${CREDENTIALS[$ip]}"
-      user=${creds%%:*}
-      pass=${creds##*:}
-
-      sshpass -p "$pass" ssh -o StrictHostKeyChecking=no $user@$ip "curl -L https://github.com/wangyu-/udp2raw-tunnel/releases/download/20200801.0/udp2raw_amd64 -o /usr/local/bin/udp2raw && chmod +x /usr/local/bin/udp2raw"
-
-      sshpass -p "$pass" ssh -o StrictHostKeyChecking=no $user@$ip "bash -c '
-cat > /etc/systemd/system/udp2raw-$IRAN_NODE-$proto.service <<EOL
+  # Create systemd service
+  cat > "/etc/systemd/system/haproxy-$server_id.service" <<EOF
 [Unit]
-Description=udp2raw tunnel for $proto from $IRAN_NODE
+Description=HAProxy for $server_id
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/udp2raw -c -l0.0.0.0:$port -r $iran_ip:$port --raw-mode faketcp
+ExecStart=/usr/sbin/haproxy -f $config_file -p /var/run/haproxy-$server_id.pid
+ExecReload=/bin/kill -USR2 \$MAINPID
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
-EOL
-systemctl daemon-reexec
-systemctl enable udp2raw-$IRAN_NODE-$proto
-systemctl restart udp2raw-$IRAN_NODE-$proto
-'"
-    done
-  }
+EOF
 
-  for proto in "${!ENABLED[@]}"; do
-    case ${TRANS[$proto]} in
-      ipvs) configure_ipvs "$proto";;
-      udp2raw) configure_udp2raw_remote "$proto";;
+  systemctl daemon-reload
+  systemctl enable --now "haproxy-$server_id"
+}
+
+function new_server() {
+  show_header
+  echo "[*] Setting up new Iranian server"
+  
+  read -rp "Enter unique server name (e.g. iran1): " server_name
+  local server_id="${server_name}-$(date +%s | sha256sum | head -c 6)"
+  
+  mkdir -p "$CONFIG_DIR/$server_id"
+  echo "{}" > "$CONFIG_DIR/$server_id/config.json"
+
+  # Get foreign servers
+  read -rp "Enter foreign server IPs (comma separated): " servers_input
+  IFS=',' read -ra servers <<< "$servers_input"
+  
+  declare -A credentials
+  for ip in "${servers[@]}"; do
+    echo "Credentials for $ip:"
+    read -rp "Username: " user
+    read -rsp "Password: " pass
+    echo
+    credentials[$ip]="$user:$pass"
+    
+    jq --arg ip "$ip" --arg user "$user" --arg pass "$pass" \
+      '.foreign_servers += {($ip): {"user": $user, "pass": $pass}}' \
+      "$CONFIG_DIR/$server_id/config.json" > tmp.json && mv tmp.json "$CONFIG_DIR/$server_id/config.json"
+  done
+
+  # Protocol setup
+  PROTOCOLS=(ssh vless vmess openvpn)
+  declare -A protocols_to_setup
+  
+  for proto in "${PROTOCOLS[@]}"; do
+    read -rp "Enable $proto? [y/N]: " yn
+    [[ "$yn" =~ ^[Yy]$ ]] || continue
+    
+    read -rp "Port for $proto: " port
+    echo "Select transport:"
+    echo "1) TCP (HAProxy with 30-min persistence)"
+    echo "2) UDP (IPVS with 30-min persistence)"
+    read -rp "Choice [1-2]: " choice
+    
+    if [[ "$choice" == "2" ]]; then
+      transport="ipvs"
+    else
+      transport="haproxy"
+    fi
+    
+    jq --arg proto "$proto" --arg port "$port" --arg transport "$transport" \
+      '.protocols += {($proto): {"port": $port, "transport": $transport}}' \
+      "$CONFIG_DIR/$server_id/config.json" > tmp.json && mv tmp.json "$CONFIG_DIR/$server_id/config.json"
+    
+    protocols_to_setup[$proto]=$transport
+  done
+
+  # Apply configurations
+  for proto in "${!protocols_to_setup[@]}"; do
+    port=$(jq -r ".protocols.$proto.port" "$CONFIG_DIR/$server_id/config.json")
+    
+    case "${protocols_to_setup[$proto]}" in
+      ipvs)
+        setup_ipvs "$proto" "$port" "$server_id" "${servers[@]}"
+        ;;
+      haproxy)
+        setup_haproxy "$server_id" "$proto"
+        ;;
     esac
   done
 
-  configure_haproxy
-  echo -e "\n✅ Tunnel setup completed for $IRAN_NODE"
-  for proto in "${!ENABLED[@]}"; do
-    echo " - $proto on ${PROT_PORT[$proto]} via ${TRANS[$proto]}"
+  # Enable logging
+  cat > "/etc/rsyslog.d/utm-$server_id.conf" <<EOF
+local0.* /var/log/utm-$server_id.log
+EOF
+  systemctl restart rsyslog
+
+  echo -e "\n[+] Server $server_id configured successfully!"
+  echo -e "Logs: /var/log/utm-$server_id.log"
+  pause
+}
+
+function remove_server() {
+  show_header
+  echo "[*] Remove existing server"
+  
+  if [[ -z $(ls "$CONFIG_DIR") ]]; then
+    echo "No servers configured!"
+    pause
+    return
+  fi
+
+  echo "Existing servers:"
+  ls "$CONFIG_DIR" | cat -n
+  read -rp "Select server number to remove: " num
+  
+  local servers=($(ls "$CONFIG_DIR"))
+  local selected="${servers[$((num-1))]}"
+  
+  [[ -z "$selected" ]] && { echo "Invalid selection!"; pause; return; }
+  
+  read -rp "Confirm remove server $selected? [y/N]: " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || return
+
+  # Stop services
+  systemctl stop "haproxy-$selected" 2>/dev/null || true
+  systemctl disable "haproxy-$selected" 2>/dev/null || true
+  
+  for proto in $(jq -r '.protocols | keys[]' "$CONFIG_DIR/$selected/config.json"); do
+    transport=$(jq -r ".protocols.$proto.transport" "$CONFIG_DIR/$selected/config.json")
+    
+    if [[ "$transport" == "ipvs" ]]; then
+      systemctl stop "ipvs-$selected-$proto" 2>/dev/null || true
+      systemctl stop "healthcheck-$selected-$proto.timer" 2>/dev/null || true
+      systemctl disable "ipvs-$selected-$proto" 2>/dev/null || true
+      systemctl disable "healthcheck-$selected-$proto.timer" 2>/dev/null || true
+      rm -f "/etc/systemd/system/ipvs-$selected-$proto.service" \
+            "/etc/systemd/system/healthcheck-$selected-$proto.timer" \
+            "/etc/systemd/system/healthcheck-$selected-$proto.service"
+    fi
+  done
+
+  rm -rf "$CONFIG_DIR/$selected"
+  rm -f "/var/log/utm-$selected.log" "/etc/rsyslog.d/utm-$selected.conf"
+  systemctl daemon-reload
+  systemctl restart rsyslog
+  
+  echo "[+] Server $selected removed successfully!"
+  pause
+}
+
+function server_status() {
+  show_header
+  echo "[*] Current servers status"
+  
+  if [[ -z $(ls "$CONFIG_DIR") ]]; then
+    echo "No servers configured!"
+    pause
+    return
+  fi
+
+  for server in "$CONFIG_DIR"/*; do
+    server_id=$(basename "$server")
+    echo -e "\nServer: \e[33m$server_id\e[0m"
+    
+    # HAProxy status
+    if systemctl is-active "haproxy-$server_id" &>/dev/null; then
+      echo -e " - HAProxy: \e[32mACTIVE\e[0m"
+      echo "   Active TCP connections:"
+      ss -tnp state established | grep "haproxy-$server_id" | awk '{print $5}' | cut -d: -f2 | sort | uniq -c
+    else
+      echo -e " - HAProxy: \e[31mINACTIVE\e[0m"
+    fi
+    
+    # IPVS status
+    ipvs_status=$(ipvsadm -ln | grep -c "$server_id")
+    if (( ipvs_status > 0 )); then
+      echo -e " - IPVS: \e[32mACTIVE\e[0m"
+      echo "   Active UDP connections:"
+      ipvsadm -ln --persistent-conn | grep -A10 "$server_id"
+      echo "   Health check logs:"
+      tail -n 5 "/var/log/utm-$server_id.log" 2>/dev/null || echo "    No logs found"
+    else
+      echo -e " - IPVS: \e[31mINACTIVE\e[0m"
+    fi
+  done
+  
+  pause
+}
+
+function main_menu() {
+  while true; do
+    show_header
+    echo "Main Menu:"
+    echo "1) Add new Iranian server"
+    echo "2) Remove Iranian server"
+    echo "3) View status"
+    echo "4) Exit"
+    
+    read -rp "Select option [1-4]: " choice
+    
+    case $choice in
+      1) install_deps; new_server;;
+      2) remove_server;;
+      3) server_status;;
+      4) exit 0;;
+      *) echo "Invalid option!"; pause;;
+    esac
   done
 }
 
-function uninstall() {
-  echo "[*] Uninstalling UTM..."
-  systemctl stop haproxy || true
-  systemctl disable haproxy || true
-  ipvsadm -C || true
-  rm -rf /etc/haproxy/haproxy.cfg /opt/utm
-  crontab -l | grep -v "/opt/utm/" | crontab -
-  echo "✅ Uninstalled successfully."
-}
-
-function show_status() {
-  echo "[*] Tunnel Status (Iran server):"
-  ss -tunlp | grep -E '0.0.0.0:' || echo "No active listeners."
-}
-
-menu
+# Start
+main_menu

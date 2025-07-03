@@ -1,13 +1,13 @@
 #!/bin/bash
-# Ultimate Tunnel Manager - Final Operational Version
+# Ultimate Tunnel Manager - Optimized Version
 set -euo pipefail
 
-# Configurations
+## Configurations
 CONFIG_DIR="/etc/utm"
 LOG_DIR="/var/log/utm"
 SSH_KEY="/root/.ssh/utm_key"
 
-# Initialize
+## Initialize
 mkdir -p "$CONFIG_DIR" "$LOG_DIR"
 touch "$LOG_DIR/utm.log"
 chmod 600 "$LOG_DIR/utm.log"
@@ -20,7 +20,7 @@ function log() {
 function show_header() {
   clear
   echo "========================================"
-  echo "  Ultimate Tunnel Manager (Operational)"
+  echo "  Ultimate Tunnel Manager (Optimized)"
   echo "========================================"
 }
 
@@ -128,6 +128,38 @@ function configure_foreign_server() {
      "$CONFIG_DIR/$server_id/config.json" > tmp.json && mv tmp.json "$CONFIG_DIR/$server_id/config.json"
   
   log "[+] Successfully configured $ip"
+}
+
+function setup_tunnel() {
+  local server_id="$1"
+  local foreign_ip="$2"
+  
+  local user=$(jq -r ".foreign_servers.\"$foreign_ip\".user" "$CONFIG_DIR/$server_id/config.json")
+  local iran_ip=$(jq -r '.iran_server.ip' "$CONFIG_DIR/$server_id/config.json")
+  
+  log "[*] Setting up tunnel to $foreign_ip"
+  
+  # 1. Create reverse SSH tunnel (foreign -> iran)
+  ssh -i "$SSH_KEY" "$user@$foreign_ip" "
+    nohup ssh -f -N -R 2222:localhost:22 $iran_ip &
+  " || {
+    log "[!] Failed to create reverse tunnel"
+    return 1
+  }
+  
+  # 2. Configure port forwarding on foreign server
+  for proto in $(jq -r '.protocols | keys[]' "$CONFIG_DIR/$server_id/config.json"); do
+    local port=$(jq -r ".protocols.$proto.port" "$CONFIG_DIR/$server_id/config.json")
+    
+    ssh -i "$SSH_KEY" "$user@$foreign_ip" "
+      iptables -t nat -A PREROUTING -p tcp --dport $port -j DNAT --to-destination $iran_ip:$port
+      iptables -t nat -A POSTROUTING -j MASQUERADE
+    " || {
+      log "[!] Failed to configure port forwarding for $proto"
+    }
+  done
+  
+  log "[+] Tunnel to $foreign_ip established successfully"
 }
 
 function generate_haproxy_config() {
@@ -337,6 +369,16 @@ function check_status() {
   done
   
   [ $ipvs_active -eq 0 ] && echo " - IPVS: No UDP protocols configured"
+  
+  # Tunnel status
+  echo " - Active tunnels:"
+  while read -r ip; do
+    if netstat -tuln | grep -q "$ip"; then
+      echo "    - $ip: ACTIVE"
+    else
+      echo "    - $ip: INACTIVE"
+    fi
+  done < <(jq -r '.foreign_servers | keys[]' "$CONFIG_DIR/$server_id/config.json")
 }
 
 function main_menu() {
@@ -378,10 +420,50 @@ function main_menu() {
               break
             fi
           done
+          
+          # Setup tunnel after successful configuration
+          if setup_tunnel "$server_id" "$ip"; then
+            log "[+] Tunnel to $ip established"
+          fi
         done
         
         # Configure protocols
         PROTOCOLS=(ssh vless vmess openvpn)
         for proto in "${PROTOCOLS[@]}"; do
           if [ "$(get_input "Enable $proto? [y/N]: " | tr '[:upper:]' '[:lower:]')" == "y" ]; then
-      
+            configure_protocol "$server_id" "$proto"
+          fi
+        done
+        
+        check_status "$server_id"
+        ;;
+      2)
+        if [ -z "$(ls -A "$CONFIG_DIR")" ]; then
+          echo "No servers configured!"
+        else
+          select server in $(ls "$CONFIG_DIR"); do
+            check_status "$server"
+            break
+          done
+        fi
+        ;;
+      3)
+        if [ -z "$(ls -A "$CONFIG_DIR")" ]; then
+          echo "No servers configured!"
+        else
+          select server in $(ls "$CONFIG_DIR"); do
+            remove_server "$server"
+            break
+          done
+        fi
+        ;;
+      4) exit 0 ;;
+      *) echo "Invalid option!" ;;
+    esac
+    
+    pause
+  done
+}
+
+# Start
+main_menu

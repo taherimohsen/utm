@@ -1,4 +1,5 @@
 #!/bin/bash
+# سیستم تانل‌زنی پیشرفته UDP
 # GitHub: https://github.com/yourusername/udp-multitunnel
 # Version: 2.0
 # License: MIT
@@ -9,7 +10,7 @@ LOG_DIR="/var/log/udp-tunnels"
 TUNNEL_PORT=42347
 SERVICE_NAME="udp-tunnel"
 
-# رنگ‌های برای نمایش زیباتر
+# رنگ‌های برای نمایش بهتر
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -22,35 +23,35 @@ mkdir -p "$CONFIG_DIR" "$LOG_DIR"
 # تابع نمایش منوی اصلی
 show_main_menu() {
     clear
-    echo -e "${YELLOW}=== مدیریت تانل‌های UDP ==="
-    echo -e "1. تنظیم سرور ایران"
-    echo -e "2. تنظیم سرور خارج"
-    echo -e "3. نمایش وضعیت تانل‌ها"
-    echo -e "4. راه‌اندازی سرویس"
-    echo -e "5. متوقف کردن سرویس"
-    echo -e "6. حذف تانل"
-    echo -e "7. خروج${NC}"
-    echo -n "انتخاب شما: "
+    echo -e "${YELLOW}=== UDP Tunnel Management ==="
+    echo -e "1. Configure Iran Server"
+    echo -e "2. Configure Foreign Server"
+    echo -e "3. Show Tunnel Status"
+    echo -e "4. Start Tunnel Service"
+    echo -e "5. Stop Tunnel Service"
+    echo -e "6. Remove Tunnel"
+    echo -e "7. Exit${NC}"
+    echo -n "Your choice: "
 }
 
 # تابع تنظیم سرور ایران
 setup_iran_server() {
-    echo -e "\n${BLUE}=== تنظیم سرور ایران ===${NC}"
+    echo -e "\n${BLUE}=== Iran Server Setup ===${NC}"
     
     # دریافت شناسه سرور
-    read -p "شناسه سرور ایران (مثلا 1): " SERVER_ID
+    read -p "Enter Iran Server ID (e.g. 1): " SERVER_ID
     
     # بررسی تکراری نبودن شناسه
     if [[ -f "$CONFIG_DIR/iran_$SERVER_ID.conf" ]]; then
-        echo -e "${RED}سرور با این شناسه قبلا تنظیم شده است!${NC}"
+        echo -e "${RED}Server with this ID already exists!${NC}"
         return 1
     fi
     
     # دریافت تنظیمات
-    read -p "پورت محلی (پیشفرض $TUNNEL_PORT): " LOCAL_PORT
+    read -p "Local port (default $TUNNEL_PORT): " LOCAL_PORT
     LOCAL_PORT=${LOCAL_PORT:-$TUNNEL_PORT}
     
-    read -p "لیست سرورهای خارجی (با کاما جدا کنید): " FOREIGN_SERVERS
+    read -p "Foreign server addresses (comma separated): " FOREIGN_SERVERS
     
     # ذخیره تنظیمات
     cat > "$CONFIG_DIR/iran_$SERVER_ID.conf" <<EOL
@@ -89,27 +90,27 @@ EOL
 
     chmod +x "/usr/local/bin/udp-tunnel-$SERVER_ID.sh"
     
-    echo -e "${GREEN}تنظیمات سرور ایران با شناسه $SERVER_ID ذخیره شد.${NC}"
+    echo -e "${GREEN}Iran server $SERVER_ID configured successfully.${NC}"
 }
 
 # تابع تنظیم سرور خارج
 setup_foreign_server() {
-    echo -e "\n${BLUE}=== تنظیم سرور خارج ===${NC}"
+    echo -e "\n${BLUE}=== Foreign Server Setup ===${NC}"
     
     # دریافت شناسه سرور
-    read -p "شناسه سرور خارج (مثلا 1): " SERVER_ID
+    read -p "Enter Foreign Server ID (e.g. 1): " SERVER_ID
     
     # بررسی تکراری نبودن شناسه
     if [[ -f "$CONFIG_DIR/foreign_$SERVER_ID.conf" ]]; then
-        echo -e "${RED}سرور با این شناسه قبلا تنظیم شده است!${NC}"
+        echo -e "${RED}Server with this ID already exists!${NC}"
         return 1
     fi
     
     # دریافت تنظیمات
-    read -p "پورت محلی (پیشفرض $TUNNEL_PORT): " LOCAL_PORT
+    read -p "Local port (default $TUNNEL_PORT): " LOCAL_PORT
     LOCAL_PORT=${LOCAL_PORT:-$TUNNEL_PORT}
     
-    read -p "لیست سرورهای ایرانی (با کاما جدا کنید): " IRAN_SERVERS
+    read -p "Iran server addresses (comma separated): " IRAN_SERVERS
     
     # ذخیره تنظیمات
     cat > "$CONFIG_DIR/foreign_$SERVER_ID.conf" <<EOL
@@ -148,43 +149,43 @@ EOL
 
     chmod +x "/usr/local/bin/udp-tunnel-$SERVER_ID.sh"
     
-    echo -e "${GREEN}تنظیمات سرور خارج با شناسه $SERVER_ID ذخیره شد.${NC}"
+    echo -e "${GREEN}Foreign server $SERVER_ID configured successfully.${NC}"
 }
 
 # تابع نمایش وضعیت
 show_status() {
-    echo -e "\n${BLUE}=== وضعیت تانل‌ها ===${NC}"
+    echo -e "\n${BLUE}=== Tunnel Status ===${NC}"
     
     # نمایش سرورهای ایران
-    echo -e "${YELLOW}سرورهای ایران:${NC}"
+    echo -e "${YELLOW}Iran Servers:${NC}"
     for conf in "$CONFIG_DIR"/iran_*.conf; do
         if [[ -f "$conf" ]]; then
             source "$conf"
-            echo -e "شناسه: $SERVER_ID | پورت: $LOCAL_PORT"
-            echo "سرورهای خارجی: ${FOREIGN_SERVERS[*]}"
+            echo -e "ID: $SERVER_ID | Port: $LOCAL_PORT"
+            echo "Foreign Servers: ${FOREIGN_SERVERS[*]}"
             echo "-----------------------------------"
         fi
     done
     
     # نمایش سرورهای خارج
-    echo -e "${YELLOW}سرورهای خارج:${NC}"
+    echo -e "${YELLOW}Foreign Servers:${NC}"
     for conf in "$CONFIG_DIR"/foreign_*.conf; do
         if [[ -f "$conf" ]]; then
             source "$conf"
-            echo -e "شناسه: $SERVER_ID | پورت: $LOCAL_PORT"
-            echo "سرورهای ایرانی: ${IRAN_SERVERS[*]}"
+            echo -e "ID: $SERVER_ID | Port: $LOCAL_PORT"
+            echo "Iran Servers: ${IRAN_SERVERS[*]}"
             echo "-----------------------------------"
         fi
     done
     
     # نمایش سرویس‌های فعال
-    echo -e "${YELLOW}سرویس‌های فعال:${NC}"
+    echo -e "${YELLOW}Active Services:${NC}"
     systemctl list-units --type=service | grep "$SERVICE_NAME"
 }
 
 # تابع راه‌اندازی سرویس
 start_service() {
-    echo -e "\n${BLUE}=== راه‌اندازی سرویس ===${NC}"
+    echo -e "\n${BLUE}=== Starting Tunnel Service ===${NC}"
     
     # ایجاد فایل سرویس systemd
     cat > "/etc/systemd/system/$SERVICE_NAME@.service" <<EOL
@@ -210,33 +211,33 @@ EOL
             conf_name=$(basename "$conf" .conf)
             systemctl enable "$SERVICE_NAME@$conf_name"
             systemctl start "$SERVICE_NAME@$conf_name"
-            echo -e "${GREEN}سرویس برای $conf_name راه‌اندازی شد.${NC}"
+            echo -e "${GREEN}Service started for $conf_name.${NC}"
         fi
     done
 }
 
 # تابع توقف سرویس
 stop_service() {
-    echo -e "\n${BLUE}=== توقف سرویس ===${NC}"
+    echo -e "\n${BLUE}=== Stopping Tunnel Service ===${NC}"
     
     for conf in "$CONFIG_DIR"/*.conf; do
         if [[ -f "$conf" ]]; then
             conf_name=$(basename "$conf" .conf)
             systemctl stop "$SERVICE_NAME@$conf_name"
             systemctl disable "$SERVICE_NAME@$conf_name"
-            echo -e "${RED}سرویس برای $conf_name متوقف شد.${NC}"
+            echo -e "${RED}Service stopped for $conf_name.${NC}"
         fi
     done
 }
 
 # تابع حذف تانل
 remove_tunnel() {
-    echo -e "\n${BLUE}=== حذف تانل ===${NC}"
+    echo -e "\n${BLUE}=== Remove Tunnel ===${NC}"
     
-    read -p "شناسه تانل (مثلا iran_1 یا foreign_1): " TUNNEL_ID
+    read -p "Enter tunnel ID (e.g. iran_1 or foreign_1): " TUNNEL_ID
     
     if [[ ! -f "$CONFIG_DIR/$TUNNEL_ID.conf" ]]; then
-        echo -e "${RED}تانل با این شناسه یافت نشد!${NC}"
+        echo -e "${RED}Tunnel not found!${NC}"
         return 1
     fi
     
@@ -249,7 +250,7 @@ remove_tunnel() {
     rm -f "/usr/local/bin/udp-tunnel-${TUNNEL_ID#*_}.sh"
     rm -f "$LOG_DIR/tunnel-$TUNNEL_ID.log"
     
-    echo -e "${GREEN}تانل $TUNNEL_ID با موفقیت حذف شد.${NC}"
+    echo -e "${GREEN}Tunnel $TUNNEL_ID removed successfully.${NC}"
 }
 
 # حلقه اصلی برنامه
@@ -265,8 +266,8 @@ while true; do
         5) stop_service ;;
         6) remove_tunnel ;;
         7) exit 0 ;;
-        *) echo -e "${RED}گزینه نامعتبر!${NC}" ;;
+        *) echo -e "${RED}Invalid option!${NC}" ;;
     esac
     
-    read -p "برای ادامه Enter بزنید..."
+    read -p "Press Enter to continue..."
 done

@@ -20,9 +20,9 @@ function log() {
 
 function show_header() {
     clear
-    echo "========================================"
-    echo "  Ultimate Tunnel Manager (Final)"
-    echo "========================================"
+    echo "============================================="
+    echo "  Ultimate Tunnel Manager (Final) Resolving"
+    echo "============================================="
 }
 
 function pause() {

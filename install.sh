@@ -430,11 +430,11 @@ function main_menu() {
                 echo ""
                 
                 for ip in "${servers[@]}"; do
-                    while true; do
-                        if configure_foreign_server "$server_id" "$ip"; then
-                            if setup_tunnel "$server_id" "$ip"; then
-                                break
-                            fi
+                    echo "=== Configuring server $ip ==="
+                    while ! configure_foreign_server "$server_id" "$ip"; do
+                        echo "[!] Failed to configure $ip"
+                        if [ "$(get_input "Try again? [y/N]: " | tr '[:upper:]' '[:lower:]')" != "y" ]; then
+                            break
                         fi
                         
                         echo "[!] Failed to configure $ip"

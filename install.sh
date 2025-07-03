@@ -59,8 +59,8 @@ function resolve_domain() {
     local domain="$1"
     log "[*] Resolving $domain..."
     
-    # Get only valid IP addresses
-    local servers=($(dig +short "$domain" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}'))
+    # فقط IPهای معتبر را بگیرد و خروجی اضافی را فیلتر کند
+    local servers=($(dig +short "$domain" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u | grep -v '^[[:space:]]*$'))
     
     if [ ${#servers[@]} -eq 0 ]; then
         log "[!] No valid IP addresses found for domain $domain"

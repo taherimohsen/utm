@@ -1,12 +1,11 @@
 #!/bin/bash
-# Ultimate Tunnel Manager - Final Fixed Version
+# Ultimate Tunnel Manager - Final Working Version
 set -euo pipefail
 
 ## Configurations
 CONFIG_DIR="/etc/utm"
 LOG_DIR="/var/log/utm"
 SSH_KEY="/root/.ssh/utm_key"
-KNOWN_HOSTS="/root/.ssh/known_hosts"
 
 ## Initialize
 mkdir -p "$CONFIG_DIR" "$LOG_DIR"
@@ -14,14 +13,15 @@ touch "$LOG_DIR/utm.log"
 chmod 600 "$LOG_DIR/utm.log"
 
 function log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_DIR/utm.log"
-    echo "$1"
+    local message="$1"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $message" >> "$LOG_DIR/utm.log"
+    echo "$message"
 }
 
 function show_header() {
     clear
     echo "========================================"
-    echo "  Ultimate Tunnel Manager (Fixed)"
+    echo "  Ultimate Tunnel Manager (Final)"
     echo "========================================"
 }
 
@@ -38,7 +38,7 @@ function install_dependencies() {
     log "[*] Checking dependencies..."
     apt-get update >/dev/null 2>&1
     
-    local deps=("jq" "dig" "haproxy" "ipvsadm" "sshpass")
+    local deps=("jq" "dig" "haproxy" "ipvsadm" "sshpass" "autossh")
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" &>/dev/null; then
             log "[+] Installing $dep..."
@@ -58,12 +58,14 @@ function install_dependencies() {
 function resolve_domain() {
     local domain="$1"
     log "[*] Resolving $domain..."
-    local servers=($(dig +short "$domain" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u))
     
-    [ ${#servers[@]} -eq 0 ] && {
-        log "[!] No IPs found for $domain"
+    # Get only valid IP addresses
+    local servers=($(dig +short "$domain" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}'))
+    
+    if [ ${#servers[@]} -eq 0 ]; then
+        log "[!] No valid IP addresses found for domain $domain"
         return 1
-    }
+    fi
     
     echo "${servers[@]}"
 }
@@ -73,6 +75,7 @@ function configure_iran_server() {
     mkdir -p "$CONFIG_DIR/$server_id"
     
     log "[*] Configuring Iranian server..."
+    
     local iran_ip=$(get_input "Iran server IP: ")
     local iran_user=$(get_input "SSH username: ")
     local iran_pass=$(get_input "SSH password: ")
@@ -95,6 +98,8 @@ function configure_iran_server() {
             foreign_servers: {},
             protocols: {}
         }' > "$CONFIG_DIR/$server_id/config.json"
+    
+    log "[+] Iranian server configured successfully"
 }
 
 function configure_foreign_server() {
@@ -106,17 +111,12 @@ function configure_foreign_server() {
     local pass=$(get_input "Password: ")
     
     log "[*] Testing SSH connection to $ip..."
-    ssh-keygen -R "$ip" >/dev/null 2>&1
-    if ! ssh-keyscan -H "$ip" >> "$KNOWN_HOSTS" 2>/dev/null; then
-        log "[!] Failed to add $ip to known_hosts"
-        return 1
-    fi
-    
     if ! sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "$user@$ip" "echo SSH test successful" &>/dev/null; then
         log "[!] SSH connection failed to $ip"
         return 1
     fi
     
+    log "[*] Copying SSH key to $ip..."
     if ! sshpass -p "$pass" ssh-copy-id -o StrictHostKeyChecking=no -i "$SSH_KEY" "$user@$ip" &>/dev/null; then
         log "[!] Failed to copy SSH key to $ip"
         return 1
@@ -139,14 +139,14 @@ function setup_tunnel() {
     local user=$(jq -r ".foreign_servers.\"$foreign_ip\".user" "$CONFIG_DIR/$server_id/config.json")
     local iran_ip=$(jq -r '.iran_server.ip' "$CONFIG_DIR/$server_id/config.json")
     
-    # Create persistent SSH tunnel with autossh
-    if ! ssh -i "$SSH_KEY" "$user@$foreign_ip" "which autossh || (apt-get update && apt-get install -y autossh)" &>/dev/null; then
-        log "[!] Failed to install autossh on $foreign_ip"
-        return 1
+    # Install autossh if not exists
+    if ! ssh -i "$SSH_KEY" "$user@$foreign_ip" "command -v autossh" &>/dev/null; then
+        ssh -i "$SSH_KEY" "$user@$foreign_ip" "apt-get update && apt-get install -y autossh" &>/dev/null
     fi
     
+    # Create persistent tunnel
     if ! ssh -i "$SSH_KEY" "$user@$foreign_ip" "nohup autossh -M 0 -o 'ServerAliveInterval 30' -o 'ServerAliveCountMax 3' -N -R 2222:localhost:22 $iran_ip &" &>/dev/null; then
-        log "[!] Failed to create reverse tunnel"
+        log "[!] Failed to create tunnel to $foreign_ip"
         return 1
     fi
     
@@ -157,7 +157,7 @@ function generate_haproxy_config() {
     local server_id="$1"
     local config_file="$CONFIG_DIR/$server_id/haproxy.cfg"
     
-    log "[*] Generating HAProxy config..."
+    log "[*] Generating HAProxy configuration..."
     
     cat > "$config_file" <<EOF
 global
@@ -229,7 +229,8 @@ EOF
         log "[!] HAProxy failed to start. Check: journalctl -u haproxy-$server_id -n 30 --no-pager"
         return 1
     fi
-    log "[+] HAProxy started successfully"
+    
+    log "[+] HAProxy service started successfully"
 }
 
 function setup_ipvs() {
@@ -237,25 +238,28 @@ function setup_ipvs() {
     local proto="$2"
     local port=$(jq -r ".protocols.$proto.port" "$CONFIG_DIR/$server_id/config.json")
     
-    log "[*] Setting up IPVS for $proto:$port..."
-    
-    # Clear existing
-    ipvsadm -C
-    
-    # Add servers (only if port is valid)
-    if [[ $port =~ ^[0-9]+$ ]] && [ "$port" -gt 0 ] && [ "$port" -lt 65536 ]; then
-        while read -r ip; do
-            ipvsadm -A -u ":$port" -s rr
-            ipvsadm -a -u ":$port" -r "$ip:$port" -m
-            log "[+] Added $ip:$port to IPVS"
-        done < <(jq -r '.foreign_servers | keys[]' "$CONFIG_DIR/$server_id/config.json")
-    else
+    # Validate port number
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
         log "[!] Invalid port number: $port"
         return 1
     fi
     
+    log "[*] Setting up IPVS for $proto on port $port..."
+    
+    # Clear existing rules
+    ipvsadm -C
+    
+    # Add servers to IPVS
+    while read -r ip; do
+        ipvsadm -A -u ":$port" -s rr
+        ipvsadm -a -u ":$port" -r "$ip:$port" -m
+        log "[+] Added $ip:$port to IPVS"
+    done < <(jq -r '.foreign_servers | keys[]' "$CONFIG_DIR/$server_id/config.json")
+    
+    # Save rules
     ipvsadm-save > "/etc/ipvs-$server_id.rules"
     
+    # Create systemd service
     cat > "/etc/systemd/system/ipvs-$server_id.service" <<EOF
 [Unit]
 Description=IPVS for $server_id
@@ -273,10 +277,12 @@ EOF
 
     systemctl daemon-reload
     systemctl enable "ipvs-$server_id" >/dev/null 2>&1
+    
     if ! systemctl start "ipvs-$server_id"; then
         log "[!] Failed to start IPVS service"
         return 1
     fi
+    
     log "[+] IPVS setup completed for $proto"
 }
 
@@ -284,20 +290,35 @@ function configure_protocol() {
     local server_id="$1"
     local proto="$2"
     
-    log "[*] Configuring $proto..."
-    local port=$(get_input "Port number: ")
+    log "[*] Configuring $proto protocol..."
+    
+    local port
+    while true; do
+        port=$(get_input "Enter port number for $proto (1-65535): ")
+        if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+            break
+        fi
+        echo "Invalid port number! Please enter a number between 1 and 65535."
+    done
+    
     local transport="haproxy"
     
-    if [ "$proto" == "openvpn" ] || [ "$(get_input "Use IPVS (for UDP)? [y/N]: " | tr '[:upper:]' '[:lower:]')" == "y" ]; then
+    if [ "$proto" == "openvpn" ]; then
         transport="ipvs"
+    elif [ "$proto" != "ssh" ]; then
+        if [ "$(get_input "Use IPVS for UDP (y/N)? " | tr '[:upper:]' '[:lower:]')" == "y" ]; then
+            transport="ipvs"
+        fi
     fi
     
+    # Update configuration
     jq --arg proto "$proto" \
        --arg port "$port" \
        --arg transport "$transport" \
        '.protocols += {($proto): {port: $port, transport: $transport}}' \
        "$CONFIG_DIR/$server_id/config.json" > tmp.json && mv tmp.json "$CONFIG_DIR/$server_id/config.json"
     
+    # Apply configuration based on transport
     case "$transport" in
         "haproxy")
             generate_haproxy_config "$server_id"
@@ -307,6 +328,8 @@ function configure_protocol() {
             setup_ipvs "$server_id" "$proto"
             ;;
     esac
+    
+    log "[+] $proto protocol configured successfully"
 }
 
 function check_status() {
@@ -321,7 +344,7 @@ function check_status() {
         ss -tlnp | grep "haproxy" | awk '{print "    - " $4}'
     else
         echo " - HAProxy: INACTIVE"
-        echo "   Check: journalctl -u haproxy-$server_id -n 20 --no-pager"
+        echo "   Check logs: journalctl -u haproxy-$server_id -n 20 --no-pager"
     fi
     
     # IPVS status
@@ -344,7 +367,8 @@ function check_status() {
     # Tunnel status
     echo " - Active tunnels:"
     while read -r ip; do
-        if ssh -i "$SSH_KEY" -o ConnectTimeout=5 "$(jq -r ".foreign_servers.\"$ip\".user" "$CONFIG_DIR/$server_id/config.json")@$ip" "netstat -tuln | grep 2222" &>/dev/null; then
+        local user=$(jq -r ".foreign_servers.\"$ip\".user" "$CONFIG_DIR/$server_id/config.json")
+        if ssh -i "$SSH_KEY" -o ConnectTimeout=5 "$user@$ip" "netstat -tuln | grep -q 2222" &>/dev/null; then
             echo "    - $ip: ACTIVE"
         else
             echo "    - $ip: INACTIVE"
@@ -386,18 +410,20 @@ function main_menu() {
                 local server_name=$(get_input "Server name (e.g. iran1): ")
                 local server_id="${server_name}-$(date +%s | head -c 6)"
                 
+                # Configure Iranian server first
                 if ! configure_iran_server "$server_id"; then
                     pause
                     continue
                 fi
                 
+                # Configure foreign servers
                 local domain=$(get_input "Foreign server domain (e.g. fo.example.com): ")
                 local servers=($(resolve_domain "$domain")) || {
                     pause
                     continue
                 }
                 
-                echo -e "\n[+] Found ${#servers[@]} servers:"
+                echo -e "\n[+] Found ${#servers[@]} valid IP addresses:"
                 for ip in "${servers[@]}"; do
                     echo " - $ip"
                 done
@@ -418,8 +444,9 @@ function main_menu() {
                     done
                 done
                 
-                PROTOCOLS=("ssh" "vless" "vmess" "openvpn")
-                for proto in "${PROTOCOLS[@]}"; do
+                # Configure protocols
+                local protocols=("ssh" "vless" "vmess" "openvpn")
+                for proto in "${protocols[@]}"; do
                     if [ "$(get_input "Enable $proto? [y/N]: " | tr '[:upper:]' '[:lower:]')" == "y" ]; then
                         configure_protocol "$server_id" "$proto"
                     fi

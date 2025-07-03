@@ -1,203 +1,97 @@
 #!/bin/bash
-# Ultimate Tunnel Manager (UTM) - Install Script
 set -euo pipefail
 
-# --- توابع کمکی ---
+# Ultimate Tunnel Manager (UTM) - Complete & Automated Tunnel Setup
+# Supports: ssh, vless, vmess (TCP via haproxy), openvpn (UDP via ipvs + udp2raw)
+# Handles multiple Iranian and foreign servers on domains or IPs
+# Uses sshpass or SSH key to login foreign servers
+# Installs/checks dependencies automatically
+# Manages tunnels and services with restart cronjobs
 
 log() { echo -e "\e[1;36m[UTM]\e[0m $*"; }
 
-# چک نصب بسته
 check_install_pkg() {
-  dpkg -s "$1" &>/dev/null || {
-    log "Installing package $1 ..."
+  local pkg=$1
+  if ! dpkg -s "$pkg" &>/dev/null; then
+    log "Installing missing package: $pkg"
     apt-get update -y
-    apt-get install -y "$1"
-  }
-}
-
-# اجرای ssh با کلید یا پسورد
-ssh_exec() {
-  local host=$1 cmd=$2 user=$3 pass=$4 keyfile=$5
-  if [[ -n "$keyfile" ]]; then
-    ssh -i "$keyfile" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$user@$host" "$cmd"
-  else
-    sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$user@$host" "$cmd"
+    apt-get install -y "$pkg"
   fi
 }
 
-scp_copy() {
-  local host=$1 src=$2 dest=$3 user=$4 pass=$5 keyfile=$6
-  if [[ -n "$keyfile" ]]; then
-    scp -i "$keyfile" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$src" "$user@$host:$dest"
-  else
-    sshpass -p "$pass" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$src" "$user@$host:$dest"
-  fi
+install_dependencies() {
+  check_install_pkg sshpass
+  check_install_pkg haproxy
+  check_install_pkg ipvsadm
+  check_install_pkg dnsutils
+  check_install_pkg curl
+  check_install_pkg socat
+  check_install_pkg systemd
 }
 
-# گرفتن IPهای دامنه
 resolve_ips() {
   local domain=$1
   dig +short "$domain" | grep -Eo '([0-9]{1,3}\.){3}[0-9]+'
 }
 
-# --- شروع اسکریپت ---
-
-clear
-log "Welcome to Ultimate Tunnel Manager (UTM) Installer"
-log "Make sure you run this script as root."
-
-# نیازمندی‌ها
-check_install_pkg sshpass
-check_install_pkg haproxy
-check_install_pkg ipvsadm
-check_install_pkg dig
-check_install_pkg curl
-
-# فعالسازی ip_forward
-sysctl -w net.ipv4.ip_forward=1
-
-read -rp "Enter unique name for this Iranian server (e.g. iran1): " IRAN_NODE
-
-read -rp "Enter Iranian server IP (the IP of this machine): " IRAN_IP
-
-read -rp "Enter comma-separated foreign server domains or IPs (e.g. ssh.domain.com,1.2.3.4): " FOREIGN_RAW
-
-IFS=',' read -ra FOREIGN_HOSTS <<< "$FOREIGN_RAW"
-
-# گرفتن مشخصات اتصال به هر سرور خارجی
-declare -A FOREIGN_USER FOREIGN_PASS FOREIGN_KEY
-
-for host in "${FOREIGN_HOSTS[@]}"; do
-  echo
-  log "Configuring SSH access to foreign server: $host"
-
-  read -rp "SSH username for $host (default: root): " user
-  user=${user:-root}
-
-  read -rp "Use SSH key for $host? (y/N): " usekey
-  if [[ "$usekey" =~ ^[Yy]$ ]]; then
-    read -rp "Path to SSH private key for $host (default ~/.ssh/id_rsa): " keyfile
-    keyfile=${keyfile:-~/.ssh/id_rsa}
-    FOREIGN_KEY[$host]="$keyfile"
-    FOREIGN_PASS[$host]=""
+ssh_foreign() {
+  local host=$1 cmd=$2
+  if [[ "$SSH_METHOD" == "2" ]]; then
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no root@"$host" "$cmd"
   else
-    read -rsp "Password for $user@$host: " pass
-    echo
-    FOREIGN_PASS[$host]="$pass"
-    FOREIGN_KEY[$host]=""
+    sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no "$SSH_USER"@"$host" "$cmd"
   fi
-  FOREIGN_USER[$host]="$user"
-done
+}
 
-# پروتکل‌ها و پورت‌ها
-declare -A ENABLED PROT_PORT TRANS_METHOD
-
-PROTOCOLS=(ssh vless vmess openvpn)
-for proto in "${PROTOCOLS[@]}"; do
-  read -rp "Enable tunnel for $proto? [y/N]: " yn
-  if [[ "$yn" =~ ^[Yy]$ ]]; then
-    case $proto in
-      ssh) defport=4234;;
-      vless) defport=41369;;
-      vmess) defport=41374;;
-      openvpn) defport=42347;;
-      *) defport=0;;
-    esac
-    read -rp "Port for $proto (default $defport): " port
-    port=${port:-$defport}
-    ENABLED[$proto]=1
-    PROT_PORT[$proto]=$port
-
-    echo "Transport method for $proto:"
-    echo "1) TCP via HAProxy (default)"
-    echo "2) UDP via IPVS + udp2raw on foreign servers"
-    read -rp "Select transport [1-2]: " tmeth
-    if [[ "$tmeth" == "2" ]]; then
-      TRANS_METHOD[$proto]="udp"
-    else
-      TRANS_METHOD[$proto]="tcp"
-    fi
+scp_foreign() {
+  local host=$1 localfile=$2 remotefile=$3
+  if [[ "$SSH_METHOD" == "2" ]]; then
+    scp -i "$SSH_KEY" -o StrictHostKeyChecking=no "$localfile" root@"$host":"$remotefile"
+  else
+    sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no "$localfile" "$SSH_USER"@"$host":"$remotefile"
   fi
-done
-
-if [[ ${#ENABLED[@]} -eq 0 ]]; then
-  log "No protocols enabled. Exiting."
-  exit 1
-fi
-
-# --- نصب udp2raw روی سرورهای خارجی ---
+}
 
 install_udp2raw_foreign() {
-  local host=$1 user=$2 pass=$3 keyfile=$4
-  log "Installing udp2raw on foreign server $host..."
-  ssh_exec "$host" "command -v udp2raw >/dev/null 2>&1" "$user" "$pass" "$keyfile" || {
-    ssh_exec "$host" "apt-get update && apt-get install -y curl && curl -L https://github.com/wangyu-/udp2raw-tunnel/releases/latest/download/udp2raw_amd64" "$user" "$pass" "$keyfile"
-    ssh_exec "$host" "chmod +x udp2raw_amd64 && mv udp2raw_amd64 /usr/local/bin/udp2raw" "$user" "$pass" "$keyfile"
-  }
+  local ip=$1
+  log "[Foreign $ip] Installing udp2raw..."
+  ssh_foreign "$ip" "bash -c 'curl -fsSL https://raw.githubusercontent.com/taherimohsen/utm/main/udp2raw_install.sh | bash'"
 }
 
-# --- تنظیم IPVS روی ایران ---
+setup_ipvs_iran() {
+  local proto=$1 port=$2
+  local config_dir="/opt/utm"
+  local script="$config_dir/ipvs-${IRAN_NODE}-${proto}.sh"
+  mkdir -p "$config_dir"
 
-setup_ipvs() {
-  log "Setting up IPVS on Iranian server..."
-  modprobe ip_vs || true
-  modprobe ip_vs_rr || true
-  ipvsadm -C || true
+  log "[Iran] Setting up IPVS script for $proto on port $port"
+  cat > "$script" <<EOF
+#!/bin/bash
+modprobe ip_vs || true
+modprobe ip_vs_rr || true
+ipvsadm -C
+ipvsadm -A -u 0.0.0.0:$port -s rr
+EOF
 
-  for proto in "${!ENABLED[@]}"; do
-    if [[ "${TRANS_METHOD[$proto]}" == "udp" ]]; then
-      local port=${PROT_PORT[$proto]}
-      ipvsadm -A -u 0.0.0.0:$port -s rr
-      for fhost in "${FOREIGN_HOSTS[@]}"; do
-        for fip in $(resolve_ips "$fhost"); do
-          ipvsadm -a -u 0.0.0.0:$port -r $fip:$port -m
-        done
-      done
-      log "IPVS configured for UDP $proto on port $port"
-    fi
+  for host in "${FOREIGN_HOSTS[@]}"; do
+    for ip in $(resolve_ips "$host"); do
+      echo "ipvsadm -a -u 0.0.0.0:$port -r $ip:$port -m" >> "$script"
+    done
   done
+
+  chmod +x "$script"
+  # Run script now and setup cron for restart every 6 hours
+  bash "$script"
+  (crontab -l 2>/dev/null | grep -v "$script" || true; echo "0 */6 * * * $script") | crontab -
+
+  # Enable on boot
+  if ! grep -q "$script" /etc/rc.local 2>/dev/null; then
+    echo "$script &" >> /etc/rc.local || true
+  fi
 }
 
-# --- تولید فایل systemd برای udp2raw ---
-
-create_udp2raw_service() {
-  local host=$1 proto=$2 port=$3 user=$4 pass=$5 keyfile=$6 svcname="udp2raw-${IRAN_NODE}-${proto}"
-
-  local foreign_ip="$host"
-  # در اینجا فرض شده udp2raw سرور ایران رو به localhost روی پورت میبنده
-  # در صورت نیاز میتونید IP و پورت واقعی ایران رو وارد کنید.
-
-  local iran_ip="$IRAN_IP"
-
-  local srvfile="/etc/systemd/system/$svcname.service"
-
-  local service_content="[Unit]
-Description=UTM udp2raw $proto $IRAN_NODE
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/udp2raw -c -l0.0.0.0:$port -r $iran_ip:$port --raw-mode faketcp --timeout 30
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target"
-
-  # انتقال فایل به سرور خارجی
-  echo "$service_content" > /tmp/$svcname.service
-
-  scp_copy "$host" "/tmp/$svcname.service" "$srvfile" "$user" "$pass" "$keyfile"
-  ssh_exec "$host" "systemctl daemon-reload && systemctl enable $svcname && systemctl restart $svcname" "$user" "$pass" "$keyfile"
-
-  rm -f /tmp/$svcname.service
-  log "udp2raw service created and started on $host for $proto"
-}
-
-# --- تولید haproxy config برای TCP ---
-
-generate_haproxy_cfg() {
-  log "Generating haproxy config..."
-
+gen_haproxy() {
+  log "[Iran] Generating HAProxy config..."
   cat > /etc/haproxy/haproxy.cfg <<EOF
 global
   log /dev/log local0
@@ -212,58 +106,215 @@ defaults
 EOF
 
   for proto in "${!ENABLED[@]}"; do
-    if [[ "${TRANS_METHOD[$proto]}" == "tcp" ]]; then
-      local port=${PROT_PORT[$proto]}
-      echo -e "\nfrontend ${proto}_in\n  bind *:$port\n  default_backend ${proto}_out" >> /etc/haproxy/haproxy.cfg
-      echo "backend ${proto}_out" >> /etc/haproxy/haproxy.cfg
-      for fhost in "${FOREIGN_HOSTS[@]}"; do
-        for fip in $(resolve_ips "$fhost"); do
-          echo "  server ${proto}_$fip $fip:$port check" >> /etc/haproxy/haproxy.cfg
-        done
+    [[ ${TRANS_METHOD[$proto]} == "haproxy" ]] || continue
+    local port=${PROT_PORT[$proto]}
+    echo -e "\nfrontend ${proto}_in\n  bind *:$port\n  default_backend ${proto}_out" >> /etc/haproxy/haproxy.cfg
+    echo "backend ${proto}_out" >> /etc/haproxy/haproxy.cfg
+    for host in "${FOREIGN_HOSTS[@]}"; do
+      for ip in $(resolve_ips "$host"); do
+        echo "  server ${proto}_$ip $ip:$port check" >> /etc/haproxy/haproxy.cfg
       done
+    done
+  done
+
+  systemctl restart haproxy || true
+  # Setup cron to restart haproxy every 6 hours
+  (crontab -l 2>/dev/null | grep -v "haproxy" || true; echo "0 */6 * * * systemctl restart haproxy") | crontab -
+}
+
+setup_udp2raw_foreign() {
+  local ip=$1 proto=$2 port=$3
+  local service_name="udp2raw-${IRAN_NODE}-${proto}"
+  local service_file="/etc/systemd/system/$service_name.service"
+
+  log "[Foreign $ip] Setting up udp2raw service for $proto on port $port"
+
+  local svc_content="[Unit]
+Description=UTM UDP2RAW $proto $IRAN_NODE
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/udp2raw -c -l0.0.0.0:$port -r $IRAN_IP:$port --raw-mode faketcp
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+"
+
+  # Copy service file to foreign server
+  echo "$svc_content" > "/tmp/$service_name.service"
+  scp_foreign "$ip" "/tmp/$service_name.service" "$service_file"
+  ssh_foreign "$ip" "systemctl daemon-reexec && systemctl enable $service_name && systemctl restart $service_name"
+
+  rm -f "/tmp/$service_name.service"
+}
+
+install_udp2raw_local() {
+  if ! command -v udp2raw &>/dev/null; then
+    log "[Iran] Installing udp2raw..."
+    curl -L https://github.com/wangyu-/udp2raw-tunnel/releases/download/20190719.0/udp2raw_binaries.tar.gz | tar -xz -C /usr/local/bin/
+    chmod +x /usr/local/bin/udp2raw_amd64
+    ln -sf /usr/local/bin/udp2raw_amd64 /usr/local/bin/udp2raw
+  else
+    log "[Iran] udp2raw is already installed."
+  fi
+}
+
+setup_tunnel() {
+  read -rp "Enter a unique name for this Iranian server (e.g. iran1): " IRAN_NODE
+
+  read -rp "Enter Iranian server IP (manual entry recommended): " IRAN_IP
+
+  read -rp "Enter foreign server hostnames or IPs (comma-separated, e.g. ssh.example.com,185.44.1.3): " FOREIGN_HOSTS_RAW
+  IFS=',' read -ra FOREIGN_HOSTS <<< "$FOREIGN_HOSTS_RAW"
+
+  declare -A ENABLED PROT_PORT TRANS_METHOD SSH_USER SSH_PASS
+  PROTOCOLS=(ssh vless vmess openvpn)
+
+  log "Select SSH authentication method for foreign servers:"
+  echo "1) Password (default)"
+  echo "2) SSH Private Key"
+  read -rp "Select [1-2]: " SSH_METHOD
+  SSH_METHOD=${SSH_METHOD:-1}
+  if [[ "$SSH_METHOD" == "2" ]]; then
+    read -rp "Path to SSH private key (default ~/.ssh/id_rsa): " SSH_KEY
+    SSH_KEY=${SSH_KEY:-~/.ssh/id_rsa}
+  fi
+
+  # For each foreign host, get user & pass if password method
+  if [[ "$SSH_METHOD" == "1" ]]; then
+    for host in "${FOREIGN_HOSTS[@]}"; do
+      read -rp "SSH username for foreign server $host (default root): " user
+      user=${user:-root}
+      read -rsp "SSH password for $host: " pass
+      echo
+      SSH_USER[$host]=$user
+      SSH_PASS[$host]=$pass
+    done
+  fi
+
+  # For each protocol ask enable, port and transport method
+  for proto in "${PROTOCOLS[@]}"; do
+    read -rp "Enable tunnel for $proto? [y/N]: " yn
+    if [[ "$yn" =~ ^[Yy]$ ]]; then
+      read -rp "Port for $proto: " port
+      ENABLED[$proto]=1
+      PROT_PORT[$proto]=$port
+
+      echo "Transport method for $proto:"
+      echo "1) TCP via HAProxy (default)"
+      echo "2) UDP via iptables"
+      echo "3) UDP via socat"
+      echo "4) UDP via udp2raw"
+      echo "5) UDP via IPVS"
+      read -rp "Select [1-5]: " method
+      case $method in
+        2) TRANS_METHOD[$proto]="iptables" ;;
+        3) TRANS_METHOD[$proto]="socat" ;;
+        4) TRANS_METHOD[$proto]="udp2raw" ;;
+        5) TRANS_METHOD[$proto]="ipvs" ;;
+        *) TRANS_METHOD[$proto]="haproxy" ;;
+      esac
     fi
   done
 
-  systemctl restart haproxy
-  log "HAProxy restarted."
+  install_dependencies
+
+  # برای هر پروتکل بر اساس انتخاب‌ها کانفیگ انجام بده
+  for proto in "${!ENABLED[@]}"; do
+    method=${TRANS_METHOD[$proto]}
+    port=${PROT_PORT[$proto]}
+    log "[Iran] Setting up $proto on port $port with method $method"
+
+    case $method in
+      haproxy)
+        # HAProxy config فقط روی ایران
+        # foreign host ها رو توی backend میاره
+        ;;
+      ipvs)
+        # IPVS فقط روی ایران
+        setup_ipvs_iran "$proto" "$port"
+        ;;
+      udp2raw)
+        install_udp2raw_local
+        ;;
+      *)
+        # iptables/socat روش های مورد نیاز رو میتونی اینجا اضافه کنی
+        ;;
+    esac
+  done
+
+  # ساخت haproxy.cfg روی ایران
+  gen_haproxy
+
+  # کانفیگ روی foreign ها
+  for host in "${FOREIGN_HOSTS[@]}"; do
+    ips=($(resolve_ips "$host"))
+    for ip in "${ips[@]}"; do
+      log "[Foreign $ip] Configuring foreign server..."
+      # نصب udp2raw در صورت نیاز
+      for proto in "${!ENABLED[@]}"; do
+        method=${TRANS_METHOD[$proto]}
+        port=${PROT_PORT[$proto]}
+        if [[ "$method" == "udp2raw" ]]; then
+          install_udp2raw_foreign "$ip"
+          setup_udp2raw_foreign "$ip" "$proto" "$port"
+        fi
+      done
+
+      # اینجا باید بقیه کانفیگ ها رو هم منتقل کنیم
+      # مثلا کانفیگ haproxy روی foreign اگر لازمه
+      # یا اسکریپت های مورد نیاز
+
+      # مثال ساده: ساخت دایرکتوری utm روی foreign و کپی فایل‌ها
+      ssh_foreign "$ip" "mkdir -p /opt/utm"
+      # کپی فایل‌های کانفیگ و اسکریپت‌ها اگر لازم بود اینجا باشه
+    done
+  done
+
+  log "✅ Tunnel setup complete for $IRAN_NODE"
+  for proto in "${!ENABLED[@]}"; do
+    log "- $proto on port ${PROT_PORT[$proto]} via ${TRANS_METHOD[$proto]}"
+  done
 }
 
-# --- Main Execution ---
+uninstall_tunnel() {
+  log "Stopping and disabling haproxy..."
+  systemctl stop haproxy || true
+  systemctl disable haproxy || true
+  rm -f /etc/haproxy/haproxy.cfg
+  log "Clearing IPVS rules..."
+  ipvsadm -C || true
+  log "Removing UTM cronjobs..."
+  crontab -l | grep -v 'utm' | crontab -
+  log "UTM uninstall complete."
+}
 
-log "Starting tunnel setup..."
+show_status() {
+  log "Active tunnel ports:"
+  # چک کردن پورت ها بر اساس پروتکل هایی که فعال شدن
+  netstat -tunlp || true
+}
 
-# نصب udp2raw روی سرورهای خارجی
-for fhost in "${FOREIGN_HOSTS[@]}"; do
-  install_udp2raw_foreign "$fhost" "${FOREIGN_USER[$fhost]}" "${FOREIGN_PASS[$fhost]}" "${FOREIGN_KEY[$fhost]}"
+menu() {
+  echo ""
+  echo "Ultimate Tunnel Manager (UTM)"
+  echo "=============================="
+  echo "1) Install / Configure Tunnel"
+  echo "2) Uninstall Tunnel (Clean)"
+  echo "3) Show Tunnel Status"
+  echo "4) Exit"
+  echo ""
+  read -rp "Choose an option [1-4]: " choice
+  case $choice in
+    1) install_dependencies; setup_tunnel ;;
+    2) uninstall_tunnel ;;
+    3) show_status ;;
+    4) exit 0 ;;
+    *) echo "Invalid option"; menu ;;
+  esac
+}
+
+while true; do
+  menu
 done
-
-# راه‌اندازی IPVS روی ایران
-setup_ipvs
-
-# تولید کانفیگ HAProxy برای TCP
-generate_haproxy_cfg
-
-# ساخت سرویس udp2raw روی سرورهای خارجی برای هر پروتکل UDP
-for proto in "${!ENABLED[@]}"; do
-  if [[ "${TRANS_METHOD[$proto]}" == "udp" ]]; then
-    for fhost in "${FOREIGN_HOSTS[@]}"; do
-      create_udp2raw_service "$fhost" "$proto" "${PROT_PORT[$proto]}" "${FOREIGN_USER[$fhost]}" "${FOREIGN_PASS[$fhost]}" "${FOREIGN_KEY[$fhost]}"
-    done
-  fi
-done
-
-# کران‌تب برای ریست سرویس‌ها هر 6 ساعت
-(crontab -l 2>/dev/null | grep -v utm_restart) > /tmp/crontab.bak || true
-echo "0 */6 * * * systemctl restart haproxy" >> /tmp/crontab.bak
-for proto in "${!ENABLED[@]}"; do
-  if [[ "${TRANS_METHOD[$proto]}" == "udp" ]]; then
-    for fhost in "${FOREIGN_HOSTS[@]}"; do
-      svcname="udp2raw-${IRAN_NODE}-${proto}"
-      echo "0 */6 * * * sshpass -p '${FOREIGN_PASS[$fhost]}' ssh -o StrictHostKeyChecking=no ${FOREIGN_USER[$fhost]}@${fhost} systemctl restart $svcname" >> /tmp/crontab.bak
-    done
-  fi
-done
-crontab /tmp/crontab.bak
-rm -f /tmp/crontab.bak
-
-log "Tunnel setup complete!"

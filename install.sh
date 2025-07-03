@@ -1,5 +1,5 @@
 #!/bin/bash
-# Ultimate Tunnel Manager - Final Version
+# Ultimate Tunnel Manager - Final Operational Version
 set -euo pipefail
 
 # Configurations
@@ -20,7 +20,7 @@ function log() {
 function show_header() {
   clear
   echo "========================================"
-  echo "  Ultimate Tunnel Manager (Final)"
+  echo "  Ultimate Tunnel Manager (Operational)"
   echo "========================================"
 }
 
@@ -60,10 +60,10 @@ function resolve_domain() {
   log "[*] Resolving $domain..."
   local servers=($(dig +short "$domain" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u))
   
-  [ ${#servers[@]} -eq 0 ] && {
+  if [ ${#servers[@]} -eq 0 ]; then
     log "[!] No IPs found for $domain"
     return 1
-  }
+  fi
   
   echo "${servers[@]}"
 }
@@ -76,6 +76,12 @@ function configure_iran_server() {
   local iran_ip=$(get_input "Iran server IP: ")
   local iran_user=$(get_input "SSH username: ")
   local iran_pass=$(get_input "SSH password: ")
+  
+  # Test local SSH
+  if ! sshpass -p "$iran_pass" ssh -o StrictHostKeyChecking=no "$iran_user@$iran_ip" "echo Local SSH test successful" &>/dev/null; then
+    log "[!] Failed to connect to Iranian server"
+    return 1
+  fi
   
   jq -n \
     --arg ip "$iran_ip" \
@@ -96,13 +102,21 @@ function configure_foreign_server() {
   local server_id="$1"
   local ip="$2"
   
-  log "[*] Configuring foreign server $ip..."
-  local user=$(get_input "Username for $ip: ")
-  local pass=$(get_input "Password for $ip: ")
+  log "[*] Configuring foreign server $ip"
+  echo "=== Server $ip ==="
+  local user=$(get_input "Username: ")
+  local pass=$(get_input "Password: ")
   
   # Test SSH connection
+  log "[*] Testing SSH connection to $ip..."
   if ! sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "$user@$ip" "echo SSH test successful" &>/dev/null; then
     log "[!] SSH connection failed to $ip"
+    return 1
+  fi
+  
+  # Copy SSH key
+  if ! sshpass -p "$pass" ssh-copy-id -o StrictHostKeyChecking=no -i "$SSH_KEY" "$user@$ip" &>/dev/null; then
+    log "[!] Failed to copy SSH key to $ip"
     return 1
   fi
   
@@ -112,6 +126,8 @@ function configure_foreign_server() {
      --arg pass "$pass" \
      '.foreign_servers += {($ip): {user: $user, pass: $pass}}' \
      "$CONFIG_DIR/$server_id/config.json" > tmp.json && mv tmp.json "$CONFIG_DIR/$server_id/config.json"
+  
+  log "[+] Successfully configured $ip"
 }
 
 function generate_haproxy_config() {
@@ -338,58 +354,34 @@ function main_menu() {
         local server_name=$(get_input "Server name (e.g. iran1): ")
         local server_id="${server_name}-$(date +%s | head -c 6)"
         
-        # Configure Iranian server
-        configure_iran_server "$server_id"
+        # Configure Iranian server first
+        if ! configure_iran_server "$server_id"; then
+          pause
+          continue
+        fi
         
         # Configure foreign servers
-        local domain=$(get_input "Foreign server domain: ")
+        local domain=$(get_input "Foreign server domain (e.g. fo.example.com): ")
         local servers=($(resolve_domain "$domain")) || {
           pause
           continue
         }
         
+        echo "[+] Found ${#servers[@]} servers:"
+        printf ' - %s\n' "${servers[@]}"
+        
         for ip in "${servers[@]}"; do
-          echo "=== Configuring $ip ==="
-          configure_foreign_server "$server_id" "$ip"
+          echo "=== Configuring server $ip ==="
+          while ! configure_foreign_server "$server_id" "$ip"; do
+            echo "[!] Failed to configure $ip"
+            if [ "$(get_input "Try again? [y/N]: " | tr '[:upper:]' '[:lower:]')" != "y" ]; then
+              break
+            fi
+          done
         done
         
         # Configure protocols
         PROTOCOLS=(ssh vless vmess openvpn)
         for proto in "${PROTOCOLS[@]}"; do
           if [ "$(get_input "Enable $proto? [y/N]: " | tr '[:upper:]' '[:lower:]')" == "y" ]; then
-            configure_protocol "$server_id" "$proto"
-          fi
-        done
-        
-        check_status "$server_id"
-        ;;
-      2)
-        if [ -z "$(ls -A "$CONFIG_DIR")" ]; then
-          echo "No servers configured!"
-        else
-          select server in $(ls "$CONFIG_DIR"); do
-            check_status "$server"
-            break
-          done
-        fi
-        ;;
-      3)
-        if [ -z "$(ls -A "$CONFIG_DIR")" ]; then
-          echo "No servers configured!"
-        else
-          select server in $(ls "$CONFIG_DIR"); do
-            remove_server "$server"
-            break
-          done
-        fi
-        ;;
-      4) exit 0 ;;
-      *) echo "Invalid option!" ;;
-    esac
-    
-    pause
-  done
-}
-
-# Start
-main_menu
+      

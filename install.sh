@@ -1,5 +1,5 @@
 #!/bin/bash
-# Ultimate UDP Tunnel Manager (All-in-One Version)
+# Ultimate UDP Tunnel Manager - Updated Version
 # GitHub: https://github.com/yourusername/udp-tunnel-manager
 
 # Configuration
@@ -37,24 +37,41 @@ setup_tunnel() {
     
     echo -e "\n${BLUE}=== Tunnel Setup ===${NC}"
     
-    read -p "Enter local UDP port (default 42347): " LOCAL_PORT
-    LOCAL_PORT=${LOCAL_PORT:-42347}
-    
     read -p "Is this the Iran server? (y/n): " IS_IRAN
     
     if [[ "$IS_IRAN" =~ ^[Yy] ]]; then
+        # Iran server setup
+        read -p "Enter local UDP port to listen on (default 42347): " LISTEN_PORT
+        LISTEN_PORT=${LISTEN_PORT:-42347}
+        
         read -p "Enter foreign server IPs (comma separated): " FOREIGN_SERVERS
-        echo "LOCAL_PORT=$LOCAL_PORT" > "$CONFIG_DIR/config"
+        read -p "Enter target port on foreign servers (default $LISTEN_PORT): " TARGET_PORT
+        TARGET_PORT=${TARGET_PORT:-$LISTEN_PORT}
+        
+        echo "LISTEN_PORT=$LISTEN_PORT" > "$CONFIG_DIR/config"
+        echo "TARGET_PORT=$TARGET_PORT" >> "$CONFIG_DIR/config"
         echo "FOREIGN_SERVERS=(${FOREIGN_SERVERS//,/ })" >> "$CONFIG_DIR/config"
         echo "SERVER_TYPE=iran" >> "$CONFIG_DIR/config"
     else
         # Foreign server setup
         apt-get install -y iptables-persistent socat
-        iptables -t nat -A PREROUTING -p udp --dport $LOCAL_PORT -j REDIRECT --to-port $LOCAL_PORT
-        iptables -A INPUT -p udp --dport $LOCAL_PORT -j ACCEPT
+        
+        read -p "Enter local UDP port to listen on (default 42347): " LISTEN_PORT
+        LISTEN_PORT=${LISTEN_PORT:-42347}
+        
+        read -p "Enter target port for OpenVPN (must be different if OpenVPN is running): " TARGET_PORT
+        while [ "$LISTEN_PORT" -eq "$TARGET_PORT" ]; do
+            echo -e "${RED}Error: Listen port and target port cannot be the same!${NC}"
+            read -p "Enter target port for OpenVPN: " TARGET_PORT
+        done
+        
+        # Configure iptables
+        iptables -t nat -A PREROUTING -p udp --dport $LISTEN_PORT -j REDIRECT --to-port $TARGET_PORT
+        iptables -A INPUT -p udp --dport $LISTEN_PORT -j ACCEPT
         netfilter-persistent save
         
-        echo "LOCAL_PORT=$LOCAL_PORT" > "$CONFIG_DIR/config"
+        echo "LISTEN_PORT=$LISTEN_PORT" > "$CONFIG_DIR/config"
+        echo "TARGET_PORT=$TARGET_PORT" >> "$CONFIG_DIR/config"
         echo "SERVER_TYPE=foreign" >> "$CONFIG_DIR/config"
     fi
 
@@ -67,11 +84,13 @@ After=network.target
 [Service]
 Type=simple
 EnvironmentFile=$CONFIG_DIR/config
-ExecStart=/bin/bash -c 'if [ "\$SERVER_TYPE" == "iran" ]; then for s in "\${FOREIGN_SERVERS[@]}"; do socat -u UDP4-LISTEN:\$LOCAL_PORT,reuseaddr,fork UDP4:\$s:\$LOCAL_PORT & done; wait; else socat -u UDP4-LISTEN:\$LOCAL_PORT,reuseaddr,fork UDP4:127.0.0.1:\$LOCAL_PORT; fi'
+ExecStart=/bin/bash -c 'if [ "\$SERVER_TYPE" == "iran" ]; then for s in "\${FOREIGN_SERVERS[@]}"; do socat -u UDP4-LISTEN:\$LISTEN_PORT,reuseaddr,fork UDP4:\$s:\$TARGET_PORT & done; wait; else socat -u UDP4-LISTEN:\$LISTEN_PORT,reuseaddr,fork UDP4:127.0.0.1:\$TARGET_PORT; fi'
 Restart=always
 RestartSec=5s
 User=root
 Group=root
+StandardOutput=file:$LOG_FILE
+StandardError=file:$LOG_FILE
 
 [Install]
 WantedBy=multi-user.target
@@ -109,8 +128,9 @@ main_menu() {
     echo -e "3. Stop Tunnel"
     echo -e "4. Restart Tunnel"
     echo -e "5. Check Status"
-    echo -e "6. Uninstall"
-    echo -e "7. Exit${NC}"
+    echo -e "6. View Logs"
+    echo -e "7. Uninstall"
+    echo -e "8. Exit${NC}"
     echo -n "Your choice: "
 }
 
@@ -131,8 +151,9 @@ while true; do
         3) service_control "stop" ;;
         4) service_control "restart" ;;
         5) systemctl status "$SERVICE_NAME" --no-pager ;;
-        6) clean_installation ;;
-        7) exit 0 ;;
+        6) tail -f "$LOG_FILE" ;;
+        7) clean_installation ;;
+        8) exit 0 ;;
         *) echo -e "${RED}Invalid option!${NC}" ;;
     esac
     

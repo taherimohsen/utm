@@ -1,14 +1,15 @@
 #!/bin/bash
-# Ultimate UDP Tunnel Manager
-# Version: 3.0
+# Ultimate UDP Tunnel Manager - Fixed Version
 # GitHub: https://github.com/yourusername/udp-tunnel-manager
+# Version: 4.0
 
 # Global Configuration
 CONFIG_DIR="/etc/udp-tunnel"
 LOG_DIR="/var/log/udp-tunnel"
 LOCK_FILE="/var/run/udp-tunnel.lock"
 SERVICE_NAME="udp-tunnel"
-AUTO_RESTART_HOURS=12
+SCRIPT_NAME="udp-tunnel-manager"
+SCRIPT_PATH="/usr/local/bin/${SCRIPT_NAME}"
 
 # Colors
 RED='\033[0;31m'
@@ -17,31 +18,39 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Initialize
+# Initialize system
 init_system() {
+    echo -e "${YELLOW}Initializing system...${NC}"
     mkdir -p "$CONFIG_DIR" "$LOG_DIR"
     touch "$LOG_DIR/connections.log" "$LOG_DIR/error.log"
+    chmod 644 "$LOG_DIR"/*.log
 }
 
-# Cleanup
+# Cleanup existing installation
 clean_system() {
     echo -e "${YELLOW}Cleaning up existing installation...${NC}"
     
-    # Stop and disable services
     systemctl stop "${SERVICE_NAME}-iran" 2>/dev/null
     systemctl stop "${SERVICE_NAME}-foreign" 2>/dev/null
     systemctl disable "${SERVICE_NAME}-iran" 2>/dev/null
     systemctl disable "${SERVICE_NAME}-foreign" 2>/dev/null
     
-    # Remove files
     rm -f "/etc/systemd/system/${SERVICE_NAME}-iran.service"
     rm -f "/etc/systemd/system/${SERVICE_NAME}-foreign.service"
-    rm -f "/usr/local/bin/${SERVICE_NAME}-manager"
-    rm -rf "$CONFIG_DIR"
+    rm -f "$SCRIPT_PATH"
     rm -f "$LOCK_FILE"
     
     systemctl daemon-reload
     echo -e "${GREEN}Cleanup completed!${NC}"
+}
+
+# Install the manager script
+install_manager() {
+    echo -e "${YELLOW}Installing manager script...${NC}"
+    cp "$0" "$SCRIPT_PATH"
+    chmod 755 "$SCRIPT_PATH"
+    chown root:root "$SCRIPT_PATH"
+    echo -e "${GREEN}Manager script installed to ${SCRIPT_PATH}${NC}"
 }
 
 # Iran Server Setup
@@ -69,9 +78,8 @@ Description=UDP Tunnel Iran Service
 After=network.target
 
 [Service]
-Type=forking
-ExecStart=/usr/local/bin/${SERVICE_NAME}-manager start iran
-ExecStop=/usr/local/bin/${SERVICE_NAME}-manager stop iran
+Type=simple
+ExecStart=${SCRIPT_PATH} run iran
 Restart=always
 RestartSec=5s
 User=root
@@ -81,14 +89,11 @@ Group=root
 WantedBy=multi-user.target
 EOL
 
-    # Enable auto-restart
-    create_restart_timer
-
     systemctl daemon-reload
     systemctl enable "${SERVICE_NAME}-iran"
     
     echo -e "${GREEN}Iran server configured successfully!${NC}"
-    echo -e "Use: systemctl start ${SERVICE_NAME}-iran"
+    echo -e "Start service with: systemctl start ${SERVICE_NAME}-iran"
 }
 
 # Foreign Server Setup
@@ -120,9 +125,8 @@ Description=UDP Tunnel Foreign Service
 After=network.target
 
 [Service]
-Type=forking
-ExecStart=/usr/local/bin/${SERVICE_NAME}-manager start foreign
-ExecStop=/usr/local/bin/${SERVICE_NAME}-manager stop foreign
+Type=simple
+ExecStart=${SCRIPT_PATH} run foreign
 Restart=always
 RestartSec=5s
 User=root
@@ -132,18 +136,15 @@ Group=root
 WantedBy=multi-user.target
 EOL
 
-    # Enable auto-restart
-    create_restart_timer
-
     systemctl daemon-reload
     systemctl enable "${SERVICE_NAME}-foreign"
     
     echo -e "${GREEN}Foreign server configured successfully!${NC}"
-    echo -e "Use: systemctl start ${SERVICE_NAME}-foreign"
+    echo -e "Start service with: systemctl start ${SERVICE_NAME}-foreign"
 }
 
-# Core Tunnel Functions
-start_tunnel() {
+# Core tunnel function
+run_tunnel() {
     SERVER_TYPE="$1"
     CONFIG_FILE="$CONFIG_DIR/${SERVER_TYPE}.conf"
     
@@ -154,38 +155,29 @@ start_tunnel() {
     
     source "$CONFIG_FILE"
     
-    (
-        flock -n 200 || exit 1
-        
-        echo "$(date) Starting ${SERVER_TYPE} tunnel on port ${LOCAL_PORT}" >> "$LOG_DIR/connections.log"
-        
-        if [[ $SERVER_TYPE == "iran" ]]; then
-            for server in "${FOREIGN_SERVERS[@]}"; do
-                socat -u UDP4-LISTEN:$LOCAL_PORT,reuseaddr,fork UDP4:$server:$LOCAL_PORT &
-                echo "$(date) Connected to $server" >> "$LOG_DIR/connections.log"
-            done
-        else
-            socat -u UDP4-LISTEN:$LOCAL_PORT,reuseaddr,fork UDP4:127.0.0.1:$LOCAL_PORT &
-        fi
-        
-        echo $! > "$LOCK_FILE"
-        flock -u 200
-    ) 200>"$LOCK_FILE"
-}
-
-stop_tunnel() {
-    if [[ -f "$LOCK_FILE" ]]; then
-        kill -9 $(cat "$LOCK_FILE") 2>/dev/null
-        rm -f "$LOCK_FILE"
+    echo "$(date) Starting ${SERVER_TYPE} tunnel on port ${LOCAL_PORT}" >> "$LOG_DIR/connections.log"
+    
+    if [[ $SERVER_TYPE == "iran" ]]; then
+        for server in "${FOREIGN_SERVERS[@]}"; do
+            socat -u UDP4-LISTEN:$LOCAL_PORT,reuseaddr,fork UDP4:$server:$LOCAL_PORT &
+            echo "$(date) Connected to $server" >> "$LOG_DIR/connections.log"
+        done
+    else
+        socat -u UDP4-LISTEN:$LOCAL_PORT,reuseaddr,fork UDP4:127.0.0.1:$LOCAL_PORT &
     fi
-    pkill -f "socat.*$LOCAL_PORT"
-    echo "$(date) Tunnel stopped" >> "$LOG_DIR/connections.log"
+    
+    wait
 }
 
-# Service Management
+# Service control
 service_control() {
     ACTION="$1"
     SERVER_TYPE=$(detect_server_type)
+    
+    if [[ -z "$SERVER_TYPE" ]]; then
+        echo -e "${RED}Error: Server type not detected!${NC}"
+        return 1
+    fi
     
     case $ACTION in
         "start")
@@ -203,35 +195,7 @@ service_control() {
     esac
 }
 
-# Auto-restart Configuration
-create_restart_timer() {
-    cat > "/etc/systemd/system/${SERVICE_NAME}-restart.timer" <<EOL
-[Unit]
-Description=Restart UDP Tunnel every ${AUTO_RESTART_HOURS} hours
-
-[Timer]
-OnBootSec=15min
-OnUnitActiveSec=${AUTO_RESTART_HOURS}h
-
-[Install]
-WantedBy=timers.target
-EOL
-
-    cat > "/etc/systemd/system/${SERVICE_NAME}-restart.service" <<EOL
-[Unit]
-Description=Restart UDP Tunnel Service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/systemctl restart ${SERVICE_NAME}-$(detect_server_type)
-EOL
-
-    systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}-restart.timer"
-    systemctl start "${SERVICE_NAME}-restart.timer"
-}
-
-# Status Monitoring
+# Show service status
 show_status() {
     SERVER_TYPE=$(detect_server_type)
     
@@ -239,13 +203,16 @@ show_status() {
     systemctl status "${SERVICE_NAME}-${SERVER_TYPE}" --no-pager
     
     echo -e "\n=== Active Connections ==="
-    ss -ulnp | grep -E "$LOCAL_PORT|socat"
+    ss -ulnp | grep -E "${LOCAL_PORT}|socat"
     
     echo -e "\n=== Connection Logs ==="
     tail -n 10 "$LOG_DIR/connections.log"
+    
+    echo -e "\n=== Error Logs ==="
+    tail -n 10 "$LOG_DIR/error.log"
 }
 
-# Helper Functions
+# Detect server type
 detect_server_type() {
     if [[ -f "$CONFIG_DIR/iran.conf" ]]; then
         echo "iran"
@@ -256,7 +223,7 @@ detect_server_type() {
     fi
 }
 
-# Main Menu
+# Main menu
 main_menu() {
     clear
     echo -e "${YELLOW}=== Ultimate UDP Tunnel Manager ==="
@@ -271,23 +238,9 @@ main_menu() {
     echo -n "Select option: "
 }
 
-# Installation
-install_manager() {
-    cp "$0" "/usr/local/bin/${SERVICE_NAME}-manager"
-    chmod 755 "/usr/local/bin/${SERVICE_NAME}-manager"
-    chown root:root "/usr/local/bin/${SERVICE_NAME}-manager"
-}
-
-# Main Execution
-if [[ $1 == "core" ]]; then
-    case $2 in
-        "start")
-            start_tunnel "$3"
-            ;;
-        "stop")
-            stop_tunnel
-            ;;
-    esac
+# Main execution
+if [[ "$1" == "run" ]]; then
+    run_tunnel "$2"
 else
     install_manager
     

@@ -215,7 +215,7 @@ detect_server_type() {
 # Main Menu
 main_menu() {
     clear
-    echo -e "${YELLOW}=== UDP Tunnel Manager v.2 ==="
+    echo -e "${YELLOW}=== UDP Tunnel Manager ==="
     echo -e "1. Setup Iran Server"
     echo -e "2. Setup Foreign Server"
     echo -e "3. Start Tunnel Service"
